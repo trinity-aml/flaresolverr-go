@@ -1,0 +1,24 @@
+[Unit]
+Description=FlareSolverr Go
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=flaresolverr
+Group=flaresolverr
+WorkingDirectory=/opt/flaresolverr-go
+Environment=HOME=/var/lib/flaresolverr
+Environment=XDG_DATA_HOME=/var/lib/flaresolverr/.local/share
+ExecStart=/usr/bin/xvfb-run -a --server-args="-screen 0 1920x1080x24 -nolisten tcp -ac" /opt/flaresolverr-go/flaresolverr
+Restart=always
+RestartSec=3
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/flaresolverr
+
+[Install]
+WantedBy=multi-user.target

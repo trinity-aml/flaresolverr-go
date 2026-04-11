@@ -1,0 +1,29 @@
+# Defaults for flaresolverr-go.
+# Lookup order:
+# 1. ./init.yaml from current working directory
+# 2. init.yaml next to the binary
+# 3. environment variables override file values
+# 4. CLI flags override everything else
+
+host: 0.0.0.0
+port: 8191
+
+browser_path: ""
+driver_path: ""
+driver_cache_dir: ""
+driver_auto_download: true
+chrome_for_testing_url: https://googlechromelabs.github.io/chrome-for-testing
+
+headless: true
+startup_user_agent: ""
+log_level: info
+log_html: false
+disable_media: false
+
+prometheus_enabled: false
+prometheus_port: 8192
+
+# proxy:
+#   url: http://proxy.example:8080
+#   username: user
+#   password: pass
