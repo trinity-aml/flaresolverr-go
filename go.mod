@@ -1,4 +1,4 @@
-module flaresolverr-go
+module github.com/trinity-aml/flaresolverr-go
 
 go 1.26
 

@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	browserpkg "flaresolverr-go/server/browser"
+	browserpkg "github.com/trinity-aml/flaresolverr-go/server/browser"
 )
 
 type browserRequest = browserpkg.Request

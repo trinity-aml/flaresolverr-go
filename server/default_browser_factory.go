@@ -1,9 +1,9 @@
 package flaresolverr
 
 import (
-	browserpkg "flaresolverr-go/server/browser"
-	chromedpbackend "flaresolverr-go/server/browser/chromedp"
-	webdriverbackend "flaresolverr-go/server/browser/webdriver"
+	browserpkg "github.com/trinity-aml/flaresolverr-go/server/browser"
+	chromedpbackend "github.com/trinity-aml/flaresolverr-go/server/browser/chromedp"
+	webdriverbackend "github.com/trinity-aml/flaresolverr-go/server/browser/webdriver"
 )
 
 type defaultBrowserFactory struct{}

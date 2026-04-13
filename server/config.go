@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"strings"
 
-	"flaresolverr-go/internal/buildinfo"
+	"github.com/trinity-aml/flaresolverr-go/internal/buildinfo"
 	"gopkg.in/yaml.v3"
 )
 

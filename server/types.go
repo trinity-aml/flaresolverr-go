@@ -1,6 +1,6 @@
 package flaresolverr
 
-import browserpkg "flaresolverr-go/server/browser"
+import browserpkg "github.com/trinity-aml/flaresolverr-go/server/browser"
 
 const (
 	StatusOK    = "ok"

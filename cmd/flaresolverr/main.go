@@ -9,7 +9,7 @@ import (
 	"syscall"
 	"time"
 
-	flaresolverr "flaresolverr-go/server"
+	flaresolverr "github.com/trinity-aml/flaresolverr-go/server"
 )
 
 func main() {
