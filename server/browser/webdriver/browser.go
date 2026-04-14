@@ -30,6 +30,7 @@ type Result = browserpkg.Result
 type Client = browserpkg.Client
 type clickTarget = browserpkg.ClickTarget
 type point = browserpkg.Point
+type documentResponse = browserpkg.DocumentResponse
 
 var appendWithEnv = browserpkg.AppendWithEnv
 var buildPostFormHTML = browserpkg.BuildPostFormHTML
@@ -52,6 +53,8 @@ var summarizeCandidateTargets = browserpkg.SummarizeCandidateTargets
 var relevantChallengeTargets = browserpkg.RelevantChallengeTargets
 var fallbackChallengeTargets = browserpkg.FallbackChallengeTargets
 var chromeArgValue = browserpkg.ChromeArgValue
+var normalizeResponseHeaders = browserpkg.NormalizeResponseHeaders
+var urlsEquivalent = browserpkg.URLsEquivalent
 
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
@@ -257,7 +260,10 @@ func (b *webDriverBrowser) createSession() error {
 				"acceptInsecureCerts":     true,
 				"pageLoadStrategy":        "normal",
 				"unhandledPromptBehavior": "ignore",
-				"goog:chromeOptions":      chromeOptions,
+				"goog:loggingPrefs": map[string]any{
+					"performance": "ALL",
+				},
+				"goog:chromeOptions": chromeOptions,
 			},
 		},
 	}
@@ -479,6 +485,14 @@ func (b *webDriverBrowser) resolve(ctx context.Context, req Request) (*Challenge
 		Cookies:   cookies,
 		UserAgent: userAgent,
 	}
+	if docResp, err := b.documentResponse(ctx, currentURL); err == nil && docResp.Status > 0 {
+		result.Status = docResp.Status
+		if len(docResp.Headers) > 0 {
+			result.Headers = docResp.Headers
+		}
+	} else if err != nil {
+		b.logger.Debug("read document response headers failed", "err", err)
+	}
 
 	if req.TabsTillVerify != nil {
 		token, err := b.resolveTurnstileToken(ctx, max(*req.TabsTillVerify, 1))
@@ -498,7 +512,6 @@ func (b *webDriverBrowser) resolve(ctx context.Context, req Request) (*Challenge
 		if err != nil {
 			return nil, "", fmt.Errorf("read response html: %w", err)
 		}
-		result.Headers = map[string]string{}
 		result.Response = htmlDoc
 	}
 
@@ -1233,11 +1246,21 @@ func (b *webDriverBrowser) executeScript(ctx context.Context, script string, arg
 	if args == nil {
 		args = []any{}
 	}
+	script = wrapWebDriverExpression(script)
 	raw, _, err := b.webDriverRequest(ctx, http.MethodPost, b.sessionPath("/execute/sync"), map[string]any{
 		"script": script,
 		"args":   args,
 	})
 	return raw, err
+}
+
+func wrapWebDriverExpression(script string) string {
+	script = strings.TrimSpace(script)
+	script = strings.TrimSuffix(script, ";")
+	if script == "" {
+		return "return null"
+	}
+	return "return (" + script + ")"
 }
 
 func (b *webDriverBrowser) executeCDP(ctx context.Context, cmd string, params map[string]any) (json.RawMessage, error) {
@@ -1285,6 +1308,93 @@ func (b *webDriverBrowser) driverLogTail() string {
 		start = len(lines) - 12
 	}
 	return strings.Join(lines[start:], " | ")
+}
+
+func (b *webDriverBrowser) documentResponse(ctx context.Context, currentURL string) (documentResponse, error) {
+	entries, err := b.performanceLog(ctx)
+	if err != nil {
+		return documentResponse{}, err
+	}
+
+	type responsePayload struct {
+		URL     string         `json:"url"`
+		Status  int            `json:"status"`
+		Headers map[string]any `json:"headers"`
+	}
+	type paramsEnvelope struct {
+		Type     string          `json:"type"`
+		Response responsePayload `json:"response"`
+	}
+	type messageEnvelope struct {
+		Message struct {
+			Method string          `json:"method"`
+			Params json.RawMessage `json:"params"`
+		} `json:"message"`
+	}
+	type performanceEntry struct {
+		Message string `json:"message"`
+	}
+
+	for i := len(entries) - 1; i >= 0; i-- {
+		var item performanceEntry
+		if err := json.Unmarshal(entries[i], &item); err != nil || strings.TrimSpace(item.Message) == "" {
+			continue
+		}
+
+		var message messageEnvelope
+		if err := json.Unmarshal([]byte(item.Message), &message); err != nil {
+			continue
+		}
+		if message.Message.Method != "Network.responseReceived" {
+			continue
+		}
+
+		var params paramsEnvelope
+		if err := json.Unmarshal(message.Message.Params, &params); err != nil {
+			continue
+		}
+		if !strings.EqualFold(params.Type, "Document") {
+			continue
+		}
+		if currentURL != "" && params.Response.URL != "" && !urlsEquivalent(currentURL, params.Response.URL) {
+			continue
+		}
+
+		return documentResponse{
+			URL:     params.Response.URL,
+			Status:  params.Response.Status,
+			Headers: normalizeResponseHeaders(params.Response.Headers),
+		}, nil
+	}
+
+	return documentResponse{}, nil
+}
+
+func (b *webDriverBrowser) performanceLog(ctx context.Context) ([]json.RawMessage, error) {
+	paths := []string{
+		b.sessionPath("/se/log"),
+		b.sessionPath("/log"),
+	}
+
+	var lastErr error
+	for _, path := range paths {
+		raw, _, err := b.webDriverRequest(ctx, http.MethodPost, path, map[string]any{"type": "performance"})
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		var entries []json.RawMessage
+		if err := json.Unmarshal(raw, &entries); err != nil {
+			return nil, err
+		}
+		return entries, nil
+	}
+
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, nil
 }
 
 func (b *webDriverBrowser) webDriverRequest(ctx context.Context, method, path string, payload any) (json.RawMessage, string, error) {

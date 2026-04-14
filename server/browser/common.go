@@ -80,6 +80,12 @@ type Point struct {
 	Y float64
 }
 
+type DocumentResponse struct {
+	URL     string
+	Status  int
+	Headers map[string]string
+}
+
 func AppendWithEnv(env []string, key, value string) []string {
 	prefix := key + "="
 	result := make([]string, 0, len(env)+1)
@@ -316,6 +322,36 @@ func ChromeArgValue(raw, name string) string {
 	return ""
 }
 
+func NormalizeResponseHeaders(headers map[string]any) map[string]string {
+	if len(headers) == 0 {
+		return nil
+	}
+
+	result := make(map[string]string, len(headers))
+	for key, value := range headers {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		if normalized := normalizeHeaderValue(value); normalized != "" {
+			result[strings.ToLower(key)] = normalized
+		}
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+func URLsEquivalent(lhs, rhs string) bool {
+	left := canonicalizeURL(lhs)
+	right := canonicalizeURL(rhs)
+	if left == "" || right == "" {
+		return strings.TrimSpace(lhs) == strings.TrimSpace(rhs)
+	}
+	return left == right
+}
+
 func FirstCookiePath(path string) string {
 	if strings.TrimSpace(path) == "" {
 		return "/"
@@ -339,4 +375,50 @@ func SleepContext(ctx context.Context, d time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+func normalizeHeaderValue(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return strings.TrimSpace(typed)
+	case []string:
+		return strings.Join(typed, ", ")
+	case []any:
+		parts := make([]string, 0, len(typed))
+		for _, item := range typed {
+			if normalized := normalizeHeaderValue(item); normalized != "" {
+				parts = append(parts, normalized)
+			}
+		}
+		return strings.Join(parts, ", ")
+	default:
+		return strings.TrimSpace(fmt.Sprint(typed))
+	}
+}
+
+func canonicalizeURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+
+	parsed.Fragment = ""
+	parsed.Host = strings.ToLower(parsed.Host)
+	if parsed.Path == "" {
+		parsed.Path = "/"
+	}
+	if parsed.Path != "/" {
+		parsed.Path = strings.TrimRight(parsed.Path, "/")
+		if parsed.Path == "" {
+			parsed.Path = "/"
+		}
+	}
+	return parsed.String()
 }

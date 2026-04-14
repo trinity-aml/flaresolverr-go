@@ -33,6 +33,7 @@ type Logger = browserpkg.Logger
 type Request = browserpkg.Request
 type Result = browserpkg.Result
 type Client = browserpkg.Client
+type documentResponse = browserpkg.DocumentResponse
 
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
@@ -98,6 +99,8 @@ type chromedpBrowser struct {
 	previousDisplay string
 	userDataDir     string
 	keepUserDataDir bool
+	responseMu      sync.Mutex
+	documentResp    documentResponse
 
 	mu sync.Mutex
 }
@@ -149,6 +152,7 @@ func NewChromedp(cfg Config, proxy *Proxy) (Client, error) {
 
 	b.allocCtx, b.allocCancel = chromedp.NewExecAllocator(context.Background(), opts...)
 	b.browserCtx, b.browserStop = chromedp.NewContext(b.allocCtx)
+	b.trackDocumentResponses()
 
 	if err := chromedp.Run(b.browserCtx); err != nil {
 		_ = b.Close()
@@ -479,6 +483,42 @@ func (b *chromedpBrowser) enableProxyAuth() error {
 	)
 }
 
+func (b *chromedpBrowser) trackDocumentResponses() {
+	chromedp.ListenTarget(b.browserCtx, func(ev any) {
+		event, ok := ev.(*network.EventResponseReceived)
+		if !ok || event == nil || event.Type != network.ResourceTypeDocument || event.Response == nil {
+			return
+		}
+
+		b.responseMu.Lock()
+		b.documentResp = documentResponse{
+			URL:     event.Response.URL,
+			Status:  int(event.Response.Status),
+			Headers: browserpkg.NormalizeResponseHeaders(event.Response.Headers),
+		}
+		b.responseMu.Unlock()
+	})
+}
+
+func (b *chromedpBrowser) resetDocumentResponse() {
+	b.responseMu.Lock()
+	b.documentResp = documentResponse{}
+	b.responseMu.Unlock()
+}
+
+func (b *chromedpBrowser) documentResponse(currentURL string) documentResponse {
+	b.responseMu.Lock()
+	defer b.responseMu.Unlock()
+
+	if b.documentResp.Status == 0 && len(b.documentResp.Headers) == 0 {
+		return documentResponse{}
+	}
+	if currentURL == "" || b.documentResp.URL == "" || browserpkg.URLsEquivalent(currentURL, b.documentResp.URL) {
+		return b.documentResp
+	}
+	return documentResponse{}
+}
+
 func (b *chromedpBrowser) Close() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -600,6 +640,8 @@ func (b *chromedpBrowser) newRunContext(parent context.Context, timeout time.Dur
 }
 
 func (b *chromedpBrowser) resolve(ctx context.Context, req Request) (*ChallengeResolutionResult, string, error) {
+	b.resetDocumentResponse()
+
 	if req.DisableMedia {
 		patterns := make([]*network.BlockPattern, 0, len(blockedURLs))
 		for _, pattern := range blockedURLs {
@@ -686,6 +728,12 @@ func (b *chromedpBrowser) resolve(ctx context.Context, req Request) (*ChallengeR
 		Cookies:   cookies,
 		UserAgent: userAgent,
 	}
+	if docResp := b.documentResponse(currentURL); docResp.Status > 0 {
+		result.Status = docResp.Status
+		if len(docResp.Headers) > 0 {
+			result.Headers = docResp.Headers
+		}
+	}
 
 	if req.TabsTillVerify != nil {
 		token, err := b.resolveTurnstileToken(ctx, max(*req.TabsTillVerify, 1))
@@ -705,7 +753,6 @@ func (b *chromedpBrowser) resolve(ctx context.Context, req Request) (*ChallengeR
 		if err != nil {
 			return nil, "", fmt.Errorf("read response html: %w", err)
 		}
-		result.Headers = map[string]string{}
 		result.Response = htmlDoc
 	}
 
