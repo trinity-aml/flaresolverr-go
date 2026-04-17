@@ -12,6 +12,7 @@ type Config struct {
 	Headless            bool
 	StartupUserAgent    string
 	LogHTML             bool
+	DebugLogging        bool
 	DisableMedia        bool
 	DriverCacheDir      string
 	DriverAutoDownload  bool

@@ -16,6 +16,7 @@ func (defaultBrowserFactory) New(cfg Config, proxy *Proxy) (browserClient, error
 		Headless:            cfg.Headless,
 		StartupUserAgent:    cfg.StartupUserAgent,
 		LogHTML:             cfg.LogHTML,
+		DebugLogging:        cfg.DebugLogging,
 		DisableMedia:        cfg.DisableMedia,
 		DriverCacheDir:      cfg.DriverCacheDir,
 		DriverAutoDownload:  cfg.DriverAutoDownload,

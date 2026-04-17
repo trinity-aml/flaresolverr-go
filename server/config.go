@@ -22,6 +22,7 @@ type Config struct {
 	Headless            bool
 	StartupUserAgent    string
 	LogHTML             bool
+	DebugLogging        bool
 	DisableMedia        bool
 	PrometheusEnabled   bool
 	PrometheusPort      int
@@ -91,6 +92,7 @@ func loadConfig(searchPaths []string) (Config, []string) {
 	applyEnvConfig(&cfg, &logLevel)
 
 	level := parseLogLevel(logLevel)
+	cfg.DebugLogging = level <= slog.LevelDebug
 	cfg.Logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
 
 	return cfg, warnings
@@ -115,6 +117,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.ChromeForTestingURL == "" {
 		c.ChromeForTestingURL = base.ChromeForTestingURL
+	}
+	if !c.DebugLogging {
+		c.DebugLogging = base.DebugLogging
 	}
 	if c.PrometheusPort == 0 {
 		c.PrometheusPort = base.PrometheusPort

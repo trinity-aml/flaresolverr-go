@@ -9,13 +9,18 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 var headlessUserAgentRE = regexp.MustCompile(`(?i)HEADLESS`)
+
+var transientDirRootMu sync.Mutex
+var transientDirRoot string
 
 var AccessDeniedTitles = []string{
 	"Access denied",
@@ -390,6 +395,56 @@ func StartXvfb(xvfbPath string) (*exec.Cmd, string, error) {
 	return startXvfbWithRange(xvfbPath)
 }
 
+func CreateTransientDir(prefix string) (string, error) {
+	if dir, err := createTransientDirInPreferredRoot(prefix); err == nil {
+		return dir, nil
+	}
+
+	for _, root := range transientDirRoots() {
+		if strings.TrimSpace(root) == "" {
+			continue
+		}
+		if err := os.MkdirAll(root, 0o700); err != nil {
+			continue
+		}
+		dir, err := os.MkdirTemp(root, prefix)
+		if err == nil {
+			transientDirRootMu.Lock()
+			transientDirRoot = root
+			transientDirRootMu.Unlock()
+			return dir, nil
+		}
+	}
+	return os.MkdirTemp("", prefix)
+}
+
+func createTransientDirInPreferredRoot(prefix string) (string, error) {
+	transientDirRootMu.Lock()
+	root := transientDirRoot
+	transientDirRootMu.Unlock()
+	if strings.TrimSpace(root) == "" {
+		return "", fmt.Errorf("preferred transient dir root is not set")
+	}
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		transientDirRootMu.Lock()
+		if transientDirRoot == root {
+			transientDirRoot = ""
+		}
+		transientDirRootMu.Unlock()
+		return "", err
+	}
+	dir, err := os.MkdirTemp(root, prefix)
+	if err == nil {
+		return dir, nil
+	}
+	transientDirRootMu.Lock()
+	if transientDirRoot == root {
+		transientDirRoot = ""
+	}
+	transientDirRootMu.Unlock()
+	return "", err
+}
+
 func normalizeHeaderValue(value any) string {
 	switch typed := value.(type) {
 	case nil:
@@ -569,4 +624,16 @@ func formatXvfbStderr(stderr string) string {
 		return ""
 	}
 	return " | xvfb stderr: " + stderr
+}
+
+func transientDirRoots() []string {
+	roots := make([]string, 0, 3)
+	if value := strings.TrimSpace(os.Getenv("FLARESOLVERR_TMPDIR")); value != "" {
+		roots = append(roots, value)
+	}
+	if value := strings.TrimSpace(os.Getenv("XDG_RUNTIME_DIR")); value != "" {
+		roots = append(roots, filepath.Join(value, "flaresolverr-go"))
+	}
+	roots = append(roots, "/dev/shm/flaresolverr-go")
+	return roots
 }

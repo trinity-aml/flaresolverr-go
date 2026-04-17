@@ -113,8 +113,6 @@ func (s *Service) handleV1(ctx context.Context, req *V1Request) (V1Response, err
 }
 
 func (s *Service) cmdSessionsCreate(ctx context.Context, req *V1Request) (V1Response, error) {
-	_ = s.getUserAgent(ctx)
-
 	proxy := req.Proxy
 	if proxy == nil {
 		proxy = s.cfg.DefaultProxy
@@ -130,6 +128,7 @@ func (s *Service) cmdSessionsCreate(ctx context.Context, req *V1Request) (V1Resp
 			Session: item.id,
 		}, nil
 	}
+	s.storeUserAgentFromBrowser(ctx, item.browser)
 	return V1Response{
 		Status:  StatusOK,
 		Message: "Session created successfully.",
@@ -190,8 +189,6 @@ func (s *Service) resolveChallenge(ctx context.Context, req *V1Request, method s
 		err    error
 	)
 
-	_ = s.getUserAgent(ctx)
-
 	if req.Session != "" {
 		ttl := time.Duration(req.SessionTTLMinutes) * time.Minute
 		item, _, err = s.sessions.get(req.Session, ttl)
@@ -238,6 +235,9 @@ func (s *Service) resolveChallenge(ctx context.Context, req *V1Request, method s
 		}
 		return nil, "", fmt.Errorf("Error solving the challenge. %s", stringsReplace(err.Error()))
 	}
+	if res != nil && res.Result != nil {
+		s.storeUserAgent(res.Result.UserAgent)
+	}
 	return res.Result, res.Message, nil
 }
 
@@ -251,29 +251,8 @@ func formatTimeoutSeconds(timeoutMS int) string {
 }
 
 func (s *Service) getUserAgent(ctx context.Context) string {
-	s.userAgentMu.Lock()
-	defer s.userAgentMu.Unlock()
-
-	if s.userAgent != "" {
-		return s.userAgent
-	}
-
-	cfg := s.cfg.withDefaults()
-	cfg.StartupUserAgent = s.userAgent
-	client, err := s.factory.New(cfg, cfg.DefaultProxy)
-	if err != nil {
-		s.logger.Warn("resolve user agent", "err", err)
-		return ""
-	}
-	defer client.Close()
-
-	userAgent, err := client.UserAgent(ctx)
-	if err != nil {
-		s.logger.Warn("resolve user agent", "err", err)
-		return ""
-	}
-	s.userAgent = userAgent
-	return userAgent
+	_ = ctx
+	return s.peekUserAgent()
 }
 
 func (s *Service) peekUserAgent() string {
@@ -286,6 +265,32 @@ func (s *Service) runtimeBrowserConfig() Config {
 	cfg := s.cfg.withDefaults()
 	cfg.StartupUserAgent = s.peekUserAgent()
 	return cfg
+}
+
+func (s *Service) storeUserAgent(value string) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return
+	}
+
+	s.userAgentMu.Lock()
+	if s.userAgent == "" {
+		s.userAgent = value
+	}
+	s.userAgentMu.Unlock()
+}
+
+func (s *Service) storeUserAgentFromBrowser(ctx context.Context, client browserClient) {
+	if client == nil || s.peekUserAgent() != "" {
+		return
+	}
+
+	userAgent, err := client.UserAgent(ctx)
+	if err != nil {
+		s.logger.Debug("read browser user agent failed", "err", err)
+		return
+	}
+	s.storeUserAgent(userAgent)
 }
 
 func stringsReplace(value string) string {

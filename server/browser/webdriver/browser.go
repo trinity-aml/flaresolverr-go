@@ -3,6 +3,8 @@ package webdriverbackend
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -55,6 +57,9 @@ var fallbackChallengeTargets = browserpkg.FallbackChallengeTargets
 var chromeArgValue = browserpkg.ChromeArgValue
 var normalizeResponseHeaders = browserpkg.NormalizeResponseHeaders
 var urlsEquivalent = browserpkg.URLsEquivalent
+var createTransientDir = browserpkg.CreateTransientDir
+
+var proxyExtensionCacheMu sync.Mutex
 
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
@@ -80,13 +85,17 @@ type webDriverBrowser struct {
 	driverCmd         *exec.Cmd
 	patchedDriverDir  string
 	patchedDriverPath string
+	driverRuntimeDir  string
 	driverLogPath     string
+	cachedUserAgent   string
 
 	xvfbCmd         *exec.Cmd
 	previousDisplay string
 	userDataDir     string
 	keepUserDataDir bool
 	proxyExtDir     string
+	keepProxyExtDir bool
+	perfLogPath     string
 
 	mu sync.Mutex
 }
@@ -168,8 +177,14 @@ func (b *webDriverBrowser) Close() error {
 		_ = os.RemoveAll(b.patchedDriverDir)
 		b.patchedDriverDir = ""
 	}
+	if b.driverRuntimeDir != "" {
+		_ = os.RemoveAll(b.driverRuntimeDir)
+		b.driverRuntimeDir = ""
+	}
 	if b.proxyExtDir != "" {
-		_ = os.RemoveAll(b.proxyExtDir)
+		if !b.keepProxyExtDir {
+			_ = os.RemoveAll(b.proxyExtDir)
+		}
 		b.proxyExtDir = ""
 	}
 	b.cleanupUserDataDir()
@@ -209,14 +224,19 @@ func (b *webDriverBrowser) startDriver() error {
 		env = appendWithEnv(env, "DISPLAY", display)
 	}
 
-	b.driverLogPath = filepath.Join(b.patchedDriverDir, "chromedriver.log")
-	cmd := exec.Command(
-		b.patchedDriverPath,
+	cmdArgs := []string{
 		fmt.Sprintf("--port=%d", port),
 		"--allowed-origins=*",
-		"--verbose",
-		"--log-path="+b.driverLogPath,
-	)
+	}
+	b.driverLogPath = ""
+	if b.cfg.DebugLogging {
+		if err := b.prepareDriverRuntimeDir(); err != nil {
+			return err
+		}
+		b.driverLogPath = filepath.Join(b.driverRuntimeDir, "chromedriver.log")
+		cmdArgs = append(cmdArgs, "--verbose", "--log-path="+b.driverLogPath)
+	}
+	cmd := exec.Command(b.patchedDriverPath, cmdArgs...)
 	cmd.Env = env
 	cmd.Stdout = nil
 	cmd.Stderr = nil
@@ -228,6 +248,7 @@ func (b *webDriverBrowser) startDriver() error {
 	b.baseURL = fmt.Sprintf("http://127.0.0.1:%d", port)
 
 	deadline := time.Now().Add(15 * time.Second)
+	waitFor := 50 * time.Millisecond
 	for time.Now().Before(deadline) {
 		statusCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 		_, _, err := b.webDriverRequest(statusCtx, http.MethodGet, "/status", nil)
@@ -235,9 +256,27 @@ func (b *webDriverBrowser) startDriver() error {
 		if err == nil {
 			return nil
 		}
-		time.Sleep(150 * time.Millisecond)
+		time.Sleep(waitFor)
+		if waitFor < 500*time.Millisecond {
+			waitFor *= 2
+			if waitFor > 500*time.Millisecond {
+				waitFor = 500 * time.Millisecond
+			}
+		}
 	}
 	return fmt.Errorf("chromedriver did not become ready")
+}
+
+func (b *webDriverBrowser) prepareDriverRuntimeDir() error {
+	if b.driverRuntimeDir != "" {
+		return nil
+	}
+	dir, err := createTransientDir("flaresolverr-go-webdriver-*")
+	if err != nil {
+		return fmt.Errorf("create chromedriver runtime dir: %w", err)
+	}
+	b.driverRuntimeDir = dir
+	return nil
 }
 
 func (b *webDriverBrowser) createSession() error {
@@ -1194,11 +1233,16 @@ func (b *webDriverBrowser) screenshot(ctx context.Context) (string, error) {
 }
 
 func (b *webDriverBrowser) userAgent(ctx context.Context) (string, error) {
+	if strings.TrimSpace(b.cachedUserAgent) != "" {
+		return b.cachedUserAgent, nil
+	}
+
 	ua, err := b.executeString(ctx, `navigator.userAgent`)
 	if err != nil {
 		return "", err
 	}
-	return scrubUserAgent(ua), nil
+	b.cachedUserAgent = scrubUserAgent(ua)
+	return b.cachedUserAgent, nil
 }
 
 func (b *webDriverBrowser) executeString(ctx context.Context, script string) (string, error) {
@@ -1281,16 +1325,41 @@ func (b *webDriverBrowser) driverLogTail() string {
 	if strings.TrimSpace(b.driverLogPath) == "" {
 		return ""
 	}
-	data, err := os.ReadFile(b.driverLogPath)
+	file, err := os.Open(b.driverLogPath)
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+
+	info, err := file.Stat()
+	if err != nil || info.Size() == 0 {
+		return ""
+	}
+
+	const maxTailBytes = 64 * 1024
+	start := int64(0)
+	if info.Size() > maxTailBytes {
+		start = info.Size() - maxTailBytes
+	}
+	if _, err := file.Seek(start, io.SeekStart); err != nil {
+		return ""
+	}
+
+	data, err := io.ReadAll(file)
 	if err != nil || len(data) == 0 {
 		return ""
 	}
-	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-	start := 0
-	if len(lines) > 12 {
-		start = len(lines) - 12
+	if start > 0 {
+		if cut := bytes.IndexByte(data, '\n'); cut >= 0 && cut+1 < len(data) {
+			data = data[cut+1:]
+		}
 	}
-	return strings.Join(lines[start:], " | ")
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	lineStart := 0
+	if len(lines) > 12 {
+		lineStart = len(lines) - 12
+	}
+	return strings.Join(lines[lineStart:], " | ")
 }
 
 func (b *webDriverBrowser) documentResponse(ctx context.Context, currentURL string) (documentResponse, error) {
@@ -1354,10 +1423,7 @@ func (b *webDriverBrowser) documentResponse(ctx context.Context, currentURL stri
 }
 
 func (b *webDriverBrowser) performanceLog(ctx context.Context) ([]json.RawMessage, error) {
-	paths := []string{
-		b.sessionPath("/se/log"),
-		b.sessionPath("/log"),
-	}
+	paths := b.performanceLogPaths()
 
 	var lastErr error
 	for _, path := range paths {
@@ -1366,6 +1432,7 @@ func (b *webDriverBrowser) performanceLog(ctx context.Context) ([]json.RawMessag
 			lastErr = err
 			continue
 		}
+		b.perfLogPath = path
 
 		var entries []json.RawMessage
 		if err := json.Unmarshal(raw, &entries); err != nil {
@@ -1378,6 +1445,25 @@ func (b *webDriverBrowser) performanceLog(ctx context.Context) ([]json.RawMessag
 		return nil, lastErr
 	}
 	return nil, nil
+}
+
+func (b *webDriverBrowser) performanceLogPaths() []string {
+	defaults := []string{
+		b.sessionPath("/se/log"),
+		b.sessionPath("/log"),
+	}
+	if strings.TrimSpace(b.perfLogPath) == "" {
+		return defaults
+	}
+
+	paths := make([]string, 0, len(defaults))
+	paths = append(paths, b.perfLogPath)
+	for _, path := range defaults {
+		if path != b.perfLogPath {
+			paths = append(paths, path)
+		}
+	}
+	return paths
 }
 
 func (b *webDriverBrowser) webDriverRequest(ctx context.Context, method, path string, payload any) (json.RawMessage, string, error) {
@@ -1491,18 +1577,12 @@ func (b *webDriverBrowser) prepareUserDataDir() error {
 		return nil
 	}
 
-	dir, err := os.MkdirTemp("", "flaresolverr-go-profile-*")
+	dir, err := createTransientDir("flaresolverr-go-profile-*")
 	if err != nil {
 		return fmt.Errorf("create browser profile dir: %w", err)
 	}
 	b.userDataDir = dir
 	b.keepUserDataDir = false
-
-	defaultDir := filepath.Join(dir, "Default")
-	if err := os.MkdirAll(defaultDir, 0o755); err != nil {
-		_ = os.RemoveAll(dir)
-		return fmt.Errorf("prepare browser profile dir: %w", err)
-	}
 	return nil
 }
 
@@ -1527,9 +1607,38 @@ func (b *webDriverBrowser) prepareProxyExtension() error {
 		return fmt.Errorf("proxy url must include host and port")
 	}
 
-	dir, err := os.MkdirTemp("", "flaresolverr-go-proxy-ext-*")
+	dir, err := ensureProxyExtensionDir(parsed, b.proxy.Username, b.proxy.Password)
 	if err != nil {
-		return fmt.Errorf("create proxy extension dir: %w", err)
+		return err
+	}
+
+	b.proxyExtDir = dir
+	b.keepProxyExtDir = true
+	return nil
+}
+
+func ensureProxyExtensionDir(parsed *url.URL, username, password string) (string, error) {
+	cacheRoot, err := proxyExtensionCacheRoot()
+	if err != nil {
+		return "", err
+	}
+
+	key := proxyExtensionCacheKey(parsed, username, password)
+	dir := filepath.Join(cacheRoot, key)
+	manifestPath := filepath.Join(dir, "manifest.json")
+	backgroundPath := filepath.Join(dir, "background.js")
+	if fileExists(manifestPath) && fileExists(backgroundPath) {
+		return dir, nil
+	}
+
+	proxyExtensionCacheMu.Lock()
+	defer proxyExtensionCacheMu.Unlock()
+
+	if fileExists(manifestPath) && fileExists(backgroundPath) {
+		return dir, nil
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("create proxy extension cache dir: %w", err)
 	}
 
 	manifest := `{
@@ -1569,18 +1678,50 @@ chrome.webRequest.onAuthRequired.addListener(
   callbackFn,
   { urls: ["<all_urls>"] },
   ["blocking"]
-);`, parsed.Scheme, parsed.Hostname(), parsed.Port(), b.proxy.Username, b.proxy.Password)
+);`, parsed.Scheme, parsed.Hostname(), parsed.Port(), username, password)
 
-	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), []byte(manifest), 0o644); err != nil {
-		_ = os.RemoveAll(dir)
+	if err := writeProxyExtensionFile(manifestPath, []byte(manifest)); err != nil {
+		return "", err
+	}
+	if err := writeProxyExtensionFile(backgroundPath, []byte(background)); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+func proxyExtensionCacheRoot() (string, error) {
+	baseDir, err := os.UserCacheDir()
+	if err != nil || strings.TrimSpace(baseDir) == "" {
+		baseDir = os.TempDir()
+	}
+	dir := filepath.Join(baseDir, "flaresolverr-go", "proxy-extension")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("create proxy extension cache root: %w", err)
+	}
+	return dir, nil
+}
+
+func proxyExtensionCacheKey(parsed *url.URL, username, password string) string {
+	sum := sha256.Sum256([]byte(strings.Join([]string{
+		strings.TrimSpace(parsed.Scheme),
+		strings.TrimSpace(parsed.Hostname()),
+		strings.TrimSpace(parsed.Port()),
+		strings.TrimSpace(username),
+		password,
+	}, "|")))
+	return hex.EncodeToString(sum[:])
+}
+
+func writeProxyExtensionFile(path string, content []byte) error {
+	tempPath := path + ".tmp"
+	if err := os.WriteFile(tempPath, content, 0o644); err != nil {
+		_ = os.Remove(tempPath)
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(dir, "background.js"), []byte(background), 0o644); err != nil {
-		_ = os.RemoveAll(dir)
+	if err := os.Rename(tempPath, path); err != nil {
+		_ = os.Remove(tempPath)
 		return err
 	}
-
-	b.proxyExtDir = dir
 	return nil
 }
 

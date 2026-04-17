@@ -24,6 +24,10 @@ const defaultChromeForTestingBaseURL = "https://googlechromelabs.github.io/chrom
 var (
 	chromeVersionRE                   = regexp.MustCompile(`\d+\.\d+\.\d+\.\d+`)
 	managedDriverMu                   sync.Mutex
+	detectedChromeVersionMu           sync.Mutex
+	detectedChromeVersionCache        = make(map[string]string)
+	managedChromeDriverPathMu         sync.Mutex
+	managedChromeDriverPathCache      = make(map[string]string)
 	chromeForTestingHTTPClientFactory = func() *http.Client {
 		return &http.Client{Timeout: 30 * time.Second}
 	}
@@ -80,7 +84,21 @@ func ensureManagedChromeDriver(ctx context.Context, cfg Config) (string, error) 
 	if err != nil {
 		return "", err
 	}
-	return ensureManagedChromeDriverVersion(ctx, cfg, browserVersion)
+
+	cacheKey, err := managedChromeDriverCacheKey(cfg, browserPath, browserVersion)
+	if err != nil {
+		return "", err
+	}
+	if path := getManagedChromeDriverPath(cacheKey); path != "" {
+		return path, nil
+	}
+
+	path, err := ensureManagedChromeDriverVersion(ctx, cfg, browserVersion)
+	if err != nil {
+		return "", err
+	}
+	storeManagedChromeDriverPath(cacheKey, path)
+	return path, nil
 }
 
 func ensureManagedChromeDriverVersion(ctx context.Context, cfg Config, browserVersion string) (string, error) {
@@ -125,12 +143,22 @@ func ensureManagedChromeDriverVersion(ctx context.Context, cfg Config, browserVe
 }
 
 func detectChromeVersion(ctx context.Context, browserPath string) (string, error) {
+	cacheKey, err := chromeVersionCacheKey(browserPath)
+	if err == nil {
+		if version := getDetectedChromeVersion(cacheKey); version != "" {
+			return version, nil
+		}
+	}
+
 	for _, args := range [][]string{{"--product-version"}, {"--version"}} {
 		runCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		output, err := exec.CommandContext(runCtx, browserPath, args...).CombinedOutput()
 		cancel()
 		version := parseChromeVersionOutput(string(output))
 		if version != "" {
+			if cacheKey != "" {
+				storeDetectedChromeVersion(cacheKey, version)
+			}
 			return version, nil
 		}
 		if err == nil {
@@ -238,6 +266,70 @@ func fetchChromeForTestingJSON(ctx context.Context, rawURL string) ([]byte, erro
 
 func chromeForTestingHTTPClient() *http.Client {
 	return chromeForTestingHTTPClientFactory()
+}
+
+func chromeVersionCacheKey(browserPath string) (string, error) {
+	info, err := os.Stat(browserPath)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s|%d|%d", browserPath, info.Size(), info.ModTime().UnixNano()), nil
+}
+
+func getDetectedChromeVersion(cacheKey string) string {
+	if strings.TrimSpace(cacheKey) == "" {
+		return ""
+	}
+	detectedChromeVersionMu.Lock()
+	defer detectedChromeVersionMu.Unlock()
+	return detectedChromeVersionCache[cacheKey]
+}
+
+func storeDetectedChromeVersion(cacheKey, version string) {
+	if strings.TrimSpace(cacheKey) == "" || strings.TrimSpace(version) == "" {
+		return
+	}
+	detectedChromeVersionMu.Lock()
+	detectedChromeVersionCache[cacheKey] = version
+	detectedChromeVersionMu.Unlock()
+}
+
+func managedChromeDriverCacheKey(cfg Config, browserPath, browserVersion string) (string, error) {
+	cacheDir, err := managedChromeDriverCacheDir(cfg)
+	if err != nil {
+		return "", err
+	}
+	return strings.Join([]string{
+		browserPath,
+		browserVersion,
+		runtime.GOOS,
+		runtime.GOARCH,
+		cacheDir,
+		strings.TrimSpace(cfg.ChromeForTestingURL),
+	}, "|"), nil
+}
+
+func getManagedChromeDriverPath(cacheKey string) string {
+	if strings.TrimSpace(cacheKey) == "" {
+		return ""
+	}
+	managedChromeDriverPathMu.Lock()
+	defer managedChromeDriverPathMu.Unlock()
+	path := managedChromeDriverPathCache[cacheKey]
+	if !fileExists(path) {
+		delete(managedChromeDriverPathCache, cacheKey)
+		return ""
+	}
+	return path
+}
+
+func storeManagedChromeDriverPath(cacheKey, path string) {
+	if strings.TrimSpace(cacheKey) == "" || strings.TrimSpace(path) == "" {
+		return
+	}
+	managedChromeDriverPathMu.Lock()
+	managedChromeDriverPathCache[cacheKey] = path
+	managedChromeDriverPathMu.Unlock()
 }
 
 func managedChromeDriverCacheDir(cfg Config) (string, error) {

@@ -118,12 +118,14 @@ func (s *Server) routes() http.Handler {
 		}
 
 		res, status := s.service.ControllerV1(r.Context(), &req)
+		if s.cfg.PrometheusEnabled {
+			s.metrics.Observe(&req, &res)
+		}
 		writeJSON(w, status, res)
 	})
 
 	var handler http.Handler = mux
 	handler = s.errorPlugin(handler)
-	handler = s.prometheusPlugin(handler)
 	handler = s.loggerPlugin(handler)
 	return handler
 }
@@ -160,24 +162,5 @@ func (s *Server) errorPlugin(next http.Handler) http.Handler {
 			}
 		}()
 		next.ServeHTTP(w, r)
-	})
-}
-
-func (s *Server) prometheusPlugin(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		r = requestWithV1Body(r)
-		writer := &captureWriter{ResponseWriter: w}
-		next.ServeHTTP(writer, r)
-
-		if !s.cfg.PrometheusEnabled || r.URL.Path != "/v1" {
-			return
-		}
-
-		var res V1Response
-		if err := json.Unmarshal(writer.body.Bytes(), &res); err != nil {
-			s.cfg.Logger.Warn("error exporting metrics", "err", err)
-			return
-		}
-		s.metrics.Observe(v1RequestFromContext(r.Context()), &res)
 	})
 }

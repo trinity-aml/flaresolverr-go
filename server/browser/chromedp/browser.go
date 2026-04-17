@@ -7,7 +7,6 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
@@ -33,6 +32,9 @@ type Logger = browserpkg.Logger
 type Request = browserpkg.Request
 type Result = browserpkg.Result
 type Client = browserpkg.Client
+
+var createTransientDir = browserpkg.CreateTransientDir
+
 type documentResponse = browserpkg.DocumentResponse
 
 func firstNonEmpty(values ...string) string {
@@ -99,6 +101,7 @@ type chromedpBrowser struct {
 	previousDisplay string
 	userDataDir     string
 	keepUserDataDir bool
+	cachedUserAgent string
 	responseMu      sync.Mutex
 	documentResp    documentResponse
 
@@ -533,18 +536,12 @@ func (b *chromedpBrowser) prepareUserDataDir() error {
 		return nil
 	}
 
-	dir, err := os.MkdirTemp("", "flaresolverr-go-profile-*")
+	dir, err := createTransientDir("flaresolverr-go-profile-*")
 	if err != nil {
 		return fmt.Errorf("create browser profile dir: %w", err)
 	}
 	b.userDataDir = dir
 	b.keepUserDataDir = false
-
-	defaultDir := filepath.Join(dir, "Default")
-	if err := os.MkdirAll(defaultDir, 0o755); err != nil {
-		_ = os.RemoveAll(dir)
-		return fmt.Errorf("prepare browser profile dir: %w", err)
-	}
 	return nil
 }
 
@@ -567,11 +564,16 @@ func (b *chromedpBrowser) UserAgent(ctx context.Context) (string, error) {
 }
 
 func (b *chromedpBrowser) userAgent(ctx context.Context) (string, error) {
+	if strings.TrimSpace(b.cachedUserAgent) != "" {
+		return b.cachedUserAgent, nil
+	}
+
 	var ua string
 	if err := chromedp.Run(ctx, chromedp.Evaluate(`navigator.userAgent`, &ua)); err != nil {
 		return "", err
 	}
-	return scrubUserAgent(ua), nil
+	b.cachedUserAgent = scrubUserAgent(ua)
+	return b.cachedUserAgent, nil
 }
 
 func (b *chromedpBrowser) Resolve(ctx context.Context, req Request) (*Result, error) {
