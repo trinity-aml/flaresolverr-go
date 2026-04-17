@@ -429,9 +429,8 @@ func (b *webDriverBrowser) resolve(ctx context.Context, req Request) (*Challenge
 	}
 
 	if req.LogHTML || b.cfg.LogHTML {
-		htmlDoc, err := b.pageHTML(ctx)
-		if err == nil {
-			b.logger.Debug("response html", "html", htmlDoc)
+		if _, err := b.pageHTML(ctx); err != nil {
+			b.logger.Debug("response html read failed", "err", err)
 		}
 	}
 
@@ -638,36 +637,20 @@ func (b *webDriverBrowser) clickVerify(ctx context.Context, tabs int) error {
 		b.logger.Debug("cloudflare verify key sequence failed", "err", err)
 	}
 
-	buttonClicked, err := b.clickVerifyHumanButton(ctx)
-	if err != nil {
+	if _, err := b.clickVerifyHumanButton(ctx); err != nil {
 		b.logger.Debug("cloudflare verify human button click failed", "err", err)
 	}
-	if buttonClicked {
-		b.logger.Debug("cloudflare verify human button clicked")
-	}
 
-	fallbackClicked, err := b.clickTabbableChallengeTarget(ctx, tabs)
-	if err != nil {
+	if _, err := b.clickTabbableChallengeTarget(ctx, tabs); err != nil {
 		b.logger.Debug("webdriver tabbable target fallback failed", "err", err)
 	}
-	if fallbackClicked {
-		b.logger.Debug("webdriver tabbable fallback clicked")
-	}
 
-	buttonClicked, err = b.clickVerifyButtons(ctx)
-	if err != nil {
+	if _, err := b.clickVerifyButtons(ctx); err != nil {
 		b.logger.Debug("cloudflare verify button click failed", "err", err)
 	}
-	if buttonClicked {
-		b.logger.Debug("cloudflare generic verify button clicked")
-	}
 
-	iframeClicked, err := b.clickChallengeIframes(ctx)
-	if err != nil {
+	if _, err := b.clickChallengeIframes(ctx); err != nil {
 		b.logger.Debug("cloudflare challenge iframe click failed", "err", err)
-	}
-	if iframeClicked {
-		b.logger.Debug("cloudflare iframe clicked")
 	}
 
 	_ = b.switchToDefaultContent(ctx)

@@ -648,9 +648,8 @@ func (b *chromedpBrowser) resolve(ctx context.Context, req Request) (*ChallengeR
 	}
 
 	if req.LogHTML || b.cfg.LogHTML {
-		htmlDoc, err := b.pageHTML(ctx)
-		if err == nil {
-			b.logger.Debug("response html", "html", htmlDoc)
+		if _, err := b.pageHTML(ctx); err != nil {
+			b.logger.Debug("response html read failed", "err", err)
 		}
 	}
 
