@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 )
 
 type Server struct {
@@ -16,18 +17,22 @@ type Server struct {
 	metrics    *metricsRegistry
 	startOnce  sync.Once
 	wg         sync.WaitGroup
+	cfgMu      sync.RWMutex
+	configPath string
 }
 
 func NewServer(cfg Config) *Server {
-	cfg = cfg.withDefaults()
+	cfg = PrepareConfig(cfg)
 	metrics, err := newMetricsRegistry(cfg)
 	if err != nil {
 		panic(err)
 	}
+	configPath, _ := ResolveConfigPath()
 	server := &Server{
-		cfg:     cfg,
-		service: NewService(cfg),
-		metrics: metrics,
+		cfg:        cfg,
+		service:    NewService(cfg),
+		metrics:    metrics,
+		configPath: configPath,
 	}
 	server.httpServer = &http.Server{
 		Addr:    cfg.addr(),
@@ -42,7 +47,7 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) ListenAndServe() error {
 	s.startOnce.Do(func() {
-		s.metrics.Start(&s.wg, s.cfg.Logger)
+		s.metrics.Start(&s.wg, s.currentLogger())
 	})
 	err := s.httpServer.ListenAndServe()
 	if errors.Is(err, http.ErrServerClosed) {
@@ -94,6 +99,9 @@ func (s *Server) routes() http.Handler {
 		writeJSON(w, http.StatusOK, s.service.Health(r.Context()))
 	})
 
+	mux.HandleFunc("/settings", s.handleSettingsPage)
+	mux.HandleFunc("/api/settings", s.handleSettingsAPI)
+
 	mux.HandleFunc("/v1", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{
@@ -113,12 +121,13 @@ func (s *Server) routes() http.Handler {
 			})
 			return
 		}
-		if req.Proxy == nil && s.cfg.DefaultProxy != nil {
-			req.Proxy = s.cfg.DefaultProxy
+		cfg := s.currentConfig()
+		if req.Proxy == nil && cfg.DefaultProxy != nil {
+			req.Proxy = cfg.DefaultProxy
 		}
 
 		res, status := s.service.ControllerV1(r.Context(), &req)
-		if s.cfg.PrometheusEnabled {
+		if cfg.PrometheusEnabled {
 			s.metrics.Observe(&req, &res)
 		}
 		writeJSON(w, status, res)
@@ -147,7 +156,7 @@ func (s *Server) loggerPlugin(next http.Handler) http.Handler {
 		if status == 0 {
 			status = http.StatusOK
 		}
-		s.cfg.Logger.Info("http request", "remote_addr", r.RemoteAddr, "method", r.Method, "url", r.URL.String(), "status", status)
+		s.currentLogger().Info("http request", "remote_addr", r.RemoteAddr, "method", r.Method, "url", r.URL.String(), "status", status)
 	})
 }
 
@@ -155,7 +164,7 @@ func (s *Server) errorPlugin(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if recovered := recover(); recovered != nil {
-				s.cfg.Logger.Error("panic", "err", recovered)
+				s.currentLogger().Error("panic", "err", recovered)
 				writeJSON(w, http.StatusInternalServerError, map[string]any{
 					"error": fmt.Sprint(recovered),
 				})
@@ -163,4 +172,39 @@ func (s *Server) errorPlugin(next http.Handler) http.Handler {
 		}()
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (s *Server) currentConfig() Config {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfg
+}
+
+func (s *Server) currentLogger() Logger {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfg.Logger
+}
+
+func (s *Server) applyConfig(cfg Config) ([]string, error) {
+	cfg = PrepareConfig(cfg)
+	current := s.currentConfig()
+	restartRequired := make([]string, 0, 1)
+	if current.Host != cfg.Host || current.Port != cfg.Port {
+		restartRequired = append(restartRequired, "main HTTP listen address")
+	}
+
+	s.cfgMu.Lock()
+	s.cfg = cfg
+	s.cfgMu.Unlock()
+
+	s.service.ApplyConfig(cfg)
+
+	applyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.metrics.ApplyConfig(applyCtx, &s.wg, cfg.Logger, cfg); err != nil {
+		return restartRequired, err
+	}
+
+	return restartRequired, nil
 }

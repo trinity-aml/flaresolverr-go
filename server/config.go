@@ -1,6 +1,7 @@
 package flaresolverr
 
 import (
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -21,6 +22,7 @@ type Config struct {
 	ChromeForTestingURL string
 	Headless            bool
 	StartupUserAgent    string
+	LogLevel            string
 	LogHTML             bool
 	DebugLogging        bool
 	DisableMedia        bool
@@ -34,19 +36,19 @@ type Config struct {
 type configFile struct {
 	Host                string           `yaml:"host"`
 	Port                int              `yaml:"port"`
-	BrowserPath         string           `yaml:"browser_path"`
-	DriverPath          string           `yaml:"driver_path"`
-	DriverCacheDir      string           `yaml:"driver_cache_dir"`
+	BrowserPath         string           `yaml:"browser_path,omitempty"`
+	DriverPath          string           `yaml:"driver_path,omitempty"`
+	DriverCacheDir      string           `yaml:"driver_cache_dir,omitempty"`
 	DriverAutoDownload  *bool            `yaml:"driver_auto_download"`
-	ChromeForTestingURL string           `yaml:"chrome_for_testing_url"`
+	ChromeForTestingURL string           `yaml:"chrome_for_testing_url,omitempty"`
 	Headless            *bool            `yaml:"headless"`
-	StartupUserAgent    string           `yaml:"startup_user_agent"`
-	LogLevel            string           `yaml:"log_level"`
+	StartupUserAgent    string           `yaml:"startup_user_agent,omitempty"`
+	LogLevel            string           `yaml:"log_level,omitempty"`
 	LogHTML             *bool            `yaml:"log_html"`
 	DisableMedia        *bool            `yaml:"disable_media"`
 	PrometheusEnabled   *bool            `yaml:"prometheus_enabled"`
 	PrometheusPort      int              `yaml:"prometheus_port"`
-	DefaultProxy        *configFileProxy `yaml:"proxy"`
+	DefaultProxy        *configFileProxy `yaml:"proxy,omitempty"`
 }
 
 type configFileProxy struct {
@@ -56,8 +58,7 @@ type configFileProxy struct {
 }
 
 func DefaultConfig() Config {
-	cfg, _ := LoadConfig()
-	return cfg
+	return PrepareConfig(defaultConfigValues())
 }
 
 func LoadConfig() (Config, []string) {
@@ -65,41 +66,32 @@ func LoadConfig() (Config, []string) {
 }
 
 func loadConfig(searchPaths []string) (Config, []string) {
-	cfg := Config{
-		Host:                "0.0.0.0",
-		Port:                8191,
-		BrowserPath:         findChromeBinary(),
-		DriverAutoDownload:  true,
-		ChromeForTestingURL: defaultChromeForTestingBaseURL,
-		Headless:            true,
-		PrometheusPort:      8192,
-		Version:             firstNonEmpty(buildinfo.Version, "dev"),
-	}
-
-	logLevel := "info"
+	cfg := defaultConfigValues()
 	var warnings []string
 
-	if fileCfg, path, err := readConfigFile(searchPaths); err != nil {
+	if fileCfg, _, err := readConfigFile(searchPaths); err != nil {
 		warnings = append(warnings, "init.yaml ignored: "+err.Error())
 	} else if fileCfg != nil {
 		applyConfigFile(&cfg, *fileCfg)
-		if strings.TrimSpace(fileCfg.LogLevel) != "" {
-			logLevel = fileCfg.LogLevel
-		}
-		_ = path
 	}
 
-	applyEnvConfig(&cfg, &logLevel)
+	applyEnvConfig(&cfg)
 
-	level := parseLogLevel(logLevel)
-	cfg.DebugLogging = level <= slog.LevelDebug
-	cfg.Logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
+	return PrepareConfig(cfg), warnings
+}
 
-	return cfg, warnings
+func PrepareConfig(cfg Config) Config {
+	cfg = cfg.withDefaults()
+	cfg.LogLevel = canonicalLogLevel(cfg.LogLevel)
+	cfg.DebugLogging = parseLogLevel(cfg.LogLevel) <= slog.LevelDebug
+	cfg.Logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: parseLogLevel(cfg.LogLevel),
+	}))
+	return cfg
 }
 
 func (c Config) withDefaults() Config {
-	base := DefaultConfig()
+	base := defaultConfigValues()
 	if c.Host == "" {
 		c.Host = base.Host
 	}
@@ -118,8 +110,8 @@ func (c Config) withDefaults() Config {
 	if c.ChromeForTestingURL == "" {
 		c.ChromeForTestingURL = base.ChromeForTestingURL
 	}
-	if !c.DebugLogging {
-		c.DebugLogging = base.DebugLogging
+	if c.LogLevel == "" {
+		c.LogLevel = base.LogLevel
 	}
 	if c.PrometheusPort == 0 {
 		c.PrometheusPort = base.PrometheusPort
@@ -127,13 +119,24 @@ func (c Config) withDefaults() Config {
 	if c.Version == "" {
 		c.Version = base.Version
 	}
-	if c.Logger == nil {
-		c.Logger = base.Logger
-	}
 	if c.DefaultProxy == nil {
 		c.DefaultProxy = base.DefaultProxy
 	}
 	return c
+}
+
+func defaultConfigValues() Config {
+	return Config{
+		Host:                "0.0.0.0",
+		Port:                8191,
+		BrowserPath:         findChromeBinary(),
+		DriverAutoDownload:  true,
+		ChromeForTestingURL: defaultChromeForTestingBaseURL,
+		Headless:            true,
+		LogLevel:            "info",
+		PrometheusPort:      8192,
+		Version:             firstNonEmpty(buildinfo.Version, "dev"),
+	}
 }
 
 func defaultInitConfigPaths() []string {
@@ -179,6 +182,82 @@ func readConfigFile(paths []string) (*configFile, string, error) {
 		return &cfg, path, nil
 	}
 	return nil, "", nil
+}
+
+func ResolveConfigPath() (string, error) {
+	paths := defaultInitConfigPaths()
+	if len(paths) == 0 {
+		return "", fmt.Errorf("init.yaml path could not be resolved")
+	}
+	if _, path, err := readConfigFile(paths); path != "" {
+		return path, nil
+	} else if err != nil {
+		return paths[0], nil
+	}
+	return paths[0], nil
+}
+
+func SaveConfig(cfg Config) (string, error) {
+	path, err := ResolveConfigPath()
+	if err != nil {
+		return "", err
+	}
+	if err := saveConfigToPath(path, cfg); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func saveConfigToPath(path string, cfg Config) error {
+	fileCfg := configFileFromConfig(cfg)
+	data, err := yaml.Marshal(&fileCfg)
+	if err != nil {
+		return fmt.Errorf("marshal init.yaml: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create init.yaml directory: %w", err)
+	}
+	tempPath := path + ".tmp"
+	if err := os.WriteFile(tempPath, data, 0o644); err != nil {
+		return fmt.Errorf("write init.yaml: %w", err)
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		_ = os.Remove(tempPath)
+		return fmt.Errorf("replace init.yaml: %w", err)
+	}
+	return nil
+}
+
+func configFileFromConfig(cfg Config) configFile {
+	fileCfg := configFile{
+		Host:                cfg.Host,
+		Port:                cfg.Port,
+		BrowserPath:         cfg.BrowserPath,
+		DriverPath:          cfg.DriverPath,
+		DriverCacheDir:      cfg.DriverCacheDir,
+		DriverAutoDownload:  boolPtr(cfg.DriverAutoDownload),
+		ChromeForTestingURL: cfg.ChromeForTestingURL,
+		Headless:            boolPtr(cfg.Headless),
+		StartupUserAgent:    cfg.StartupUserAgent,
+		LogLevel:            canonicalLogLevel(cfg.LogLevel),
+		LogHTML:             boolPtr(cfg.LogHTML),
+		DisableMedia:        boolPtr(cfg.DisableMedia),
+		PrometheusEnabled:   boolPtr(cfg.PrometheusEnabled),
+		PrometheusPort:      cfg.PrometheusPort,
+	}
+	if cfg.DefaultProxy != nil && strings.TrimSpace(cfg.DefaultProxy.URL) != "" {
+		fileCfg.DefaultProxy = &configFileProxy{
+			URL:      cfg.DefaultProxy.URL,
+			Username: cfg.DefaultProxy.Username,
+			Password: cfg.DefaultProxy.Password,
+		}
+	}
+	return fileCfg
+}
+
+func boolPtr(value bool) *bool {
+	v := value
+	return &v
 }
 
 func applyConfigFile(cfg *Config, fileCfg configFile) {
@@ -230,7 +309,7 @@ func applyConfigFile(cfg *Config, fileCfg configFile) {
 	}
 }
 
-func applyEnvConfig(cfg *Config, logLevel *string) {
+func applyEnvConfig(cfg *Config) {
 	cfg.Host = getenv("HOST", cfg.Host)
 	cfg.Port = getenvInt("PORT", cfg.Port)
 	cfg.BrowserPath = firstNonEmpty(os.Getenv("BROWSER_PATH"), cfg.BrowserPath)
@@ -244,12 +323,10 @@ func applyEnvConfig(cfg *Config, logLevel *string) {
 	cfg.DisableMedia = getenvBool("DISABLE_MEDIA", cfg.DisableMedia)
 	cfg.PrometheusEnabled = getenvBool("PROMETHEUS_ENABLED", cfg.PrometheusEnabled)
 	cfg.PrometheusPort = getenvInt("PROMETHEUS_PORT", cfg.PrometheusPort)
+	cfg.LogLevel = firstNonEmpty(os.Getenv("LOG_LEVEL"), cfg.LogLevel)
 
 	if proxy := proxyFromEnv(); proxy != nil {
 		cfg.DefaultProxy = proxy
-	}
-	if raw := os.Getenv("LOG_LEVEL"); strings.TrimSpace(raw) != "" {
-		*logLevel = raw
 	}
 }
 
@@ -270,7 +347,7 @@ func proxyFromEnv() *Proxy {
 }
 
 func parseLogLevel(raw string) slog.Level {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
+	switch canonicalLogLevel(raw) {
 	case "debug":
 		return slog.LevelDebug
 	case "warn", "warning":
@@ -279,6 +356,19 @@ func parseLogLevel(raw string) slog.Level {
 		return slog.LevelError
 	default:
 		return slog.LevelInfo
+	}
+}
+
+func canonicalLogLevel(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "debug":
+		return "debug"
+	case "warn", "warning":
+		return "warn"
+	case "error":
+		return "error"
+	default:
+		return "info"
 	}
 }
 

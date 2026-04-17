@@ -94,26 +94,41 @@ func (s *sessionStore) get(sessionID string, ttl time.Duration) (*session, bool,
 	return s.create(sessionID, nil, true)
 }
 
+func (s *sessionStore) applyConfig(cfg Config) {
+	s.mu.Lock()
+	s.cfg = cfg
+	s.mu.Unlock()
+}
+
 func (s *sessionStore) destroy(sessionID string) bool {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	item, ok := s.sessions[sessionID]
 	if !ok {
+		s.mu.Unlock()
 		return false
 	}
-	_ = item.browser.Close()
 	delete(s.sessions, sessionID)
+	s.mu.Unlock()
+
+	item.mu.Lock()
+	defer item.mu.Unlock()
+	_ = item.browser.Close()
 	return true
 }
 
 func (s *sessionStore) destroyAll() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
+	items := make([]*session, 0, len(s.sessions))
 	for key, item := range s.sessions {
-		_ = item.browser.Close()
+		items = append(items, item)
 		delete(s.sessions, key)
+	}
+	s.mu.Unlock()
+
+	for _, item := range items {
+		item.mu.Lock()
+		_ = item.browser.Close()
+		item.mu.Unlock()
 	}
 }
 

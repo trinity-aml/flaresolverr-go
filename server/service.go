@@ -15,6 +15,7 @@ type Service struct {
 	logger   Logger
 	sessions *sessionStore
 	factory  browserFactory
+	cfgMu    sync.RWMutex
 
 	userAgentMu sync.Mutex
 	userAgent   string
@@ -32,7 +33,7 @@ func NewService(cfg Config) *Service {
 }
 
 func newService(cfg Config, factory browserFactory) *Service {
-	cfg = cfg.withDefaults()
+	cfg = PrepareConfig(cfg)
 	service := &Service{
 		cfg:     cfg,
 		logger:  cfg.Logger,
@@ -47,10 +48,27 @@ func (s *Service) Close() error {
 	return nil
 }
 
+func (s *Service) ApplyConfig(cfg Config) {
+	cfg = PrepareConfig(cfg)
+
+	s.cfgMu.Lock()
+	s.cfg = cfg
+	s.logger = cfg.Logger
+	s.cfgMu.Unlock()
+
+	s.sessions.applyConfig(cfg)
+	s.sessions.destroyAll()
+
+	s.userAgentMu.Lock()
+	s.userAgent = ""
+	s.userAgentMu.Unlock()
+}
+
 func (s *Service) Index(ctx context.Context) IndexResponse {
+	cfg := s.currentConfig()
 	return IndexResponse{
 		Msg:       "FlareSolverr is ready!",
-		Version:   s.cfg.Version,
+		Version:   cfg.Version,
 		UserAgent: s.getUserAgent(ctx),
 	}
 }
@@ -61,6 +79,7 @@ func (s *Service) Health(context.Context) HealthResponse {
 
 func (s *Service) ControllerV1(ctx context.Context, req *V1Request) (V1Response, int) {
 	start := time.Now().UnixMilli()
+	logger := s.currentLogger()
 
 	res, err := s.handleV1(ctx, req)
 	statusCode := 200
@@ -70,16 +89,17 @@ func (s *Service) ControllerV1(ctx context.Context, req *V1Request) (V1Response,
 			Message: "Error: " + err.Error(),
 		}
 		statusCode = 500
-		s.logger.Error("request failed", "err", err)
+		logger.Error("request failed", "err", err)
 	}
 
 	res.StartTimestamp = start
 	res.EndTimestamp = time.Now().UnixMilli()
-	res.Version = s.cfg.Version
+	res.Version = s.currentConfig().Version
 	return res, statusCode
 }
 
 func (s *Service) handleV1(ctx context.Context, req *V1Request) (V1Response, error) {
+	logger := s.currentLogger()
 	if req == nil {
 		return V1Response{}, errors.New("Request body is mandatory.")
 	}
@@ -87,10 +107,10 @@ func (s *Service) handleV1(ctx context.Context, req *V1Request) (V1Response, err
 		return V1Response{}, errors.New("Request parameter 'cmd' is mandatory.")
 	}
 	if req.Headers != nil {
-		s.logger.Warn("request parameter 'headers' was removed in FlareSolverr v2")
+		logger.Warn("request parameter 'headers' was removed in FlareSolverr v2")
 	}
 	if req.UserAgent != "" {
-		s.logger.Warn("request parameter 'userAgent' was removed in FlareSolverr v2")
+		logger.Warn("request parameter 'userAgent' was removed in FlareSolverr v2")
 	}
 	if req.MaxTimeout < 1 {
 		req.MaxTimeout = 60000
@@ -113,9 +133,10 @@ func (s *Service) handleV1(ctx context.Context, req *V1Request) (V1Response, err
 }
 
 func (s *Service) cmdSessionsCreate(ctx context.Context, req *V1Request) (V1Response, error) {
+	cfg := s.currentConfig()
 	proxy := req.Proxy
 	if proxy == nil {
-		proxy = s.cfg.DefaultProxy
+		proxy = cfg.DefaultProxy
 	}
 	item, fresh, err := s.sessions.create(req.Session, proxy, false)
 	if err != nil {
@@ -155,6 +176,7 @@ func (s *Service) cmdSessionsDestroy(req *V1Request) (V1Response, error) {
 }
 
 func (s *Service) cmdRequest(ctx context.Context, req *V1Request, method string) (V1Response, error) {
+	logger := s.currentLogger()
 	if req.URL == "" {
 		return V1Response{}, fmt.Errorf("Request parameter 'url' is mandatory in '%s' command.", req.Cmd)
 	}
@@ -165,10 +187,10 @@ func (s *Service) cmdRequest(ctx context.Context, req *V1Request, method string)
 		return V1Response{}, errors.New("Request parameter 'postData' is mandatory in 'request.post' command.")
 	}
 	if req.Download != nil {
-		s.logger.Warn("request parameter 'download' was removed in FlareSolverr v2")
+		logger.Warn("request parameter 'download' was removed in FlareSolverr v2")
 	}
 	if req.ReturnRawHTML != nil {
-		s.logger.Warn("request parameter 'returnRawHtml' was removed in FlareSolverr v2")
+		logger.Warn("request parameter 'returnRawHtml' was removed in FlareSolverr v2")
 	}
 
 	result, message, err := s.resolveChallenge(ctx, req, method)
@@ -183,6 +205,7 @@ func (s *Service) cmdRequest(ctx context.Context, req *V1Request, method string)
 }
 
 func (s *Service) resolveChallenge(ctx context.Context, req *V1Request, method string) (*ChallengeResolutionResult, string, error) {
+	cfg := s.currentConfig()
 	var (
 		client browserClient
 		item   *session
@@ -218,9 +241,9 @@ func (s *Service) resolveChallenge(ctx context.Context, req *V1Request, method s
 		ReturnOnlyCookies: req.ReturnOnlyCookies,
 		ReturnScreenshot:  req.ReturnScreenshot,
 		WaitInSeconds:     req.WaitInSeconds,
-		DisableMedia:      req.DisableMedia != nil && *req.DisableMedia || req.DisableMedia == nil && s.cfg.DisableMedia,
+		DisableMedia:      req.DisableMedia != nil && *req.DisableMedia || req.DisableMedia == nil && cfg.DisableMedia,
 		TabsTillVerify:    req.TabsTillVerify,
-		LogHTML:           s.cfg.LogHTML,
+		LogHTML:           cfg.LogHTML,
 	}
 
 	if item != nil {
@@ -262,7 +285,7 @@ func (s *Service) peekUserAgent() string {
 }
 
 func (s *Service) runtimeBrowserConfig() Config {
-	cfg := s.cfg.withDefaults()
+	cfg := s.currentConfig().withDefaults()
 	cfg.StartupUserAgent = s.peekUserAgent()
 	return cfg
 }
@@ -287,10 +310,22 @@ func (s *Service) storeUserAgentFromBrowser(ctx context.Context, client browserC
 
 	userAgent, err := client.UserAgent(ctx)
 	if err != nil {
-		s.logger.Debug("read browser user agent failed", "err", err)
+		s.currentLogger().Debug("read browser user agent failed", "err", err)
 		return
 	}
 	s.storeUserAgent(userAgent)
+}
+
+func (s *Service) currentConfig() Config {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfg
+}
+
+func (s *Service) currentLogger() Logger {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.logger
 }
 
 func stringsReplace(value string) string {
