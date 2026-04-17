@@ -1,6 +1,6 @@
 # flaresolverr-go
 
-Go-порт [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) с совместимыми endpoint'ами `/`, `/health`, `/v1`.
+Go-порт [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) с совместимыми endpoint'ами `/`, `/health`, `/v1` и встроенным web UI для управления настройками.
 
 ## Что реализовано
 
@@ -17,6 +17,10 @@ Go-порт [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) с со
 - если авто-скачивание недоступно, проект откатывается к `chromedp`
 - proxy auth через DevTools `Fetch.authRequired`, без Python helper-а
 - Prometheus exporter на отдельном порту и Go-плагины `logger`, `error`, `prometheus`
+- web UI на `/settings` и JSON API на `/api/settings`
+- сохранение `init.yaml` из UI с атомарной записью на диск
+- live-apply настроек для новых запросов и новых browser-session без перезапуска процесса
+- hot-reload Prometheus exporter при смене `prometheus_enabled` / `prometheus_port`
 
 ## Архитектура
 
@@ -43,12 +47,25 @@ Go-порт [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) с со
 go run ./cmd/flaresolverr
 ```
 
+После старта доступны:
+
+- API index: `http://127.0.0.1:8191/`
+- healthcheck: `http://127.0.0.1:8191/health`
+- совместимый API: `http://127.0.0.1:8191/v1`
+- web UI настроек: `http://127.0.0.1:8191/settings`
+
 Пример запроса:
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8191/v1 \
   -H 'Content-Type: application/json' \
   --data '{"cmd":"request.get","url":"https://example.com","maxTimeout":60000}'
+```
+
+Пример чтения текущих настроек:
+
+```bash
+curl -sS http://127.0.0.1:8191/api/settings
 ```
 
 ## Конфиг
@@ -69,6 +86,32 @@ curl -sS -X POST http://127.0.0.1:8191/v1 \
 
 В репозитории лежит пример/дефолтный файл [init.yaml](init.yaml).
 
+### Изменение настроек через web UI
+
+Страница `/settings` позволяет:
+
+- просмотреть текущую runtime-конфигурацию
+- изменить параметры и сохранить их в `init.yaml`
+- сразу применить новые настройки для новых запросов
+- перезапустить Prometheus exporter на новом порту без рестарта процесса
+
+Что применяется сразу после сохранения:
+
+- browser/runtime-настройки для новых ephemeral browser и новых `sessions.create`
+- `default proxy`
+- уровень логирования
+- настройки `disable_media`, `headless`, `driver_*`, `chrome_for_testing_url`
+- `prometheus_enabled` и `prometheus_port`
+
+Что требует рестарта основного процесса:
+
+- `host`
+- `port`
+
+При сохранении через UI существующие browser-session закрываются специально, чтобы новые настройки гарантированно начали использоваться для следующих запросов.
+
+Важно: при следующем старте процесса приоритет конфигурации не меняется. Если `HOST`, `PORT`, `HEADLESS`, `LOG_LEVEL` или другие значения заданы через environment / CLI flags, они снова перекроют сохранённый `init.yaml`.
+
 ## Переменные окружения
 
 - `HOST`, `PORT`
@@ -83,6 +126,17 @@ curl -sS -X POST http://127.0.0.1:8191/v1 \
 - `PROMETHEUS_ENABLED`
 - `PROMETHEUS_PORT`
 - `PROXY_URL`, `PROXY_USERNAME`, `PROXY_PASSWORD`
+- `LOG_LEVEL`
+
+## Безопасность
+
+У web UI и `/api/settings` сейчас нет встроенной аутентификации.
+
+Если сервис доступен не только локально:
+
+- не публикуй `/settings` и `/api/settings` напрямую в интернет
+- ограничивай доступ firewall'ом, reverse proxy ACL или VPN
+- при необходимости выноси UI только на внутренний интерфейс
 
 ## Сборка
 
