@@ -1479,35 +1479,12 @@ func (b *webDriverBrowser) prepareHeadlessMode() (bool, string, error) {
 }
 
 func (b *webDriverBrowser) startDisplay(xvfbPath string) (string, error) {
-	for displayNumber := 99; displayNumber < 120; displayNumber++ {
-		socketPath := fmt.Sprintf("/tmp/.X11-unix/X%d", displayNumber)
-		if _, err := os.Stat(socketPath); err == nil {
-			continue
-		}
-
-		display := fmt.Sprintf(":%d", displayNumber)
-		cmd := exec.Command(xvfbPath, display, "-screen", "0", "1920x1080x24", "-nolisten", "tcp")
-		cmd.Stdout = nil
-		cmd.Stderr = nil
-		if err := cmd.Start(); err != nil {
-			continue
-		}
-
-		for range 50 {
-			if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
-				break
-			}
-			if _, err := os.Stat(socketPath); err == nil {
-				b.xvfbCmd = cmd
-				return display, nil
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-
-		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
+	cmd, display, err := browserpkg.StartXvfb(xvfbPath)
+	if err != nil {
+		return "", err
 	}
-	return "", fmt.Errorf("start Xvfb: no usable display found")
+	b.xvfbCmd = cmd
+	return display, nil
 }
 
 func (b *webDriverBrowser) stopDisplay() {

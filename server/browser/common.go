@@ -1,11 +1,16 @@
 package browser
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"html"
+	"io"
 	"net/url"
+	"os"
+	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -377,6 +382,14 @@ func SleepContext(ctx context.Context, d time.Duration) error {
 	}
 }
 
+func StartXvfb(xvfbPath string) (*exec.Cmd, string, error) {
+	if cmd, display, err := startXvfbWithDisplayFD(xvfbPath); err == nil {
+		return cmd, display, nil
+	}
+
+	return startXvfbWithRange(xvfbPath)
+}
+
 func normalizeHeaderValue(value any) string {
 	switch typed := value.(type) {
 	case nil:
@@ -421,4 +434,139 @@ func canonicalizeURL(raw string) string {
 		}
 	}
 	return parsed.String()
+}
+
+func startXvfbWithDisplayFD(xvfbPath string) (*exec.Cmd, string, error) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		return nil, "", fmt.Errorf("create Xvfb pipe: %w", err)
+	}
+	defer reader.Close()
+
+	var stderr bytes.Buffer
+	cmd := exec.Command(xvfbPath, "-displayfd", "3", "-screen", "0", "1920x1080x24", "-nolisten", "tcp")
+	cmd.Stdout = nil
+	cmd.Stderr = &stderr
+	cmd.ExtraFiles = []*os.File{writer}
+
+	if err := cmd.Start(); err != nil {
+		_ = writer.Close()
+		return nil, "", fmt.Errorf("start Xvfb with -displayfd: %w", err)
+	}
+	_ = writer.Close()
+
+	exitCh := make(chan error, 1)
+	go func() {
+		exitCh <- cmd.Wait()
+	}()
+
+	displayCh := make(chan string, 1)
+	readErrCh := make(chan error, 1)
+	go func() {
+		data, readErr := io.ReadAll(reader)
+		if readErr != nil {
+			readErrCh <- readErr
+			return
+		}
+
+		value := strings.TrimSpace(string(data))
+		if value == "" {
+			readErrCh <- fmt.Errorf("Xvfb did not report a display number")
+			return
+		}
+		displayNumber, convErr := strconv.Atoi(value)
+		if convErr != nil {
+			readErrCh <- fmt.Errorf("invalid Xvfb display number %q", value)
+			return
+		}
+		displayCh <- fmt.Sprintf(":%d", displayNumber)
+	}()
+
+	timer := time.NewTimer(10 * time.Second)
+	defer timer.Stop()
+
+	select {
+	case display := <-displayCh:
+		return cmd, display, nil
+	case readErr := <-readErrCh:
+		_ = cmd.Process.Kill()
+		<-exitCh
+		return nil, "", fmt.Errorf("start Xvfb with -displayfd: %w%s", readErr, formatXvfbStderr(stderr.String()))
+	case waitErr := <-exitCh:
+		return nil, "", fmt.Errorf("start Xvfb with -displayfd: %w%s", waitErr, formatXvfbStderr(stderr.String()))
+	case <-timer.C:
+		_ = cmd.Process.Kill()
+		<-exitCh
+		return nil, "", fmt.Errorf("start Xvfb with -displayfd: timeout waiting for display%s", formatXvfbStderr(stderr.String()))
+	}
+}
+
+func startXvfbWithRange(xvfbPath string) (*exec.Cmd, string, error) {
+	var lastErr error
+
+	for displayNumber := 99; displayNumber < 200; displayNumber++ {
+		lockPath := fmt.Sprintf("/tmp/.X%d-lock", displayNumber)
+		socketPath := fmt.Sprintf("/tmp/.X11-unix/X%d", displayNumber)
+		if _, err := os.Stat(socketPath); err == nil {
+			continue
+		}
+		if _, err := os.Stat(lockPath); err == nil {
+			continue
+		}
+
+		display := fmt.Sprintf(":%d", displayNumber)
+		var stderr bytes.Buffer
+		cmd := exec.Command(xvfbPath, display, "-screen", "0", "1920x1080x24", "-nolisten", "tcp")
+		cmd.Stdout = nil
+		cmd.Stderr = &stderr
+		if err := cmd.Start(); err != nil {
+			lastErr = err
+			continue
+		}
+
+		exitCh := make(chan error, 1)
+		go func() {
+			exitCh <- cmd.Wait()
+		}()
+
+		failed := false
+		for range 50 {
+			select {
+			case waitErr := <-exitCh:
+				lastErr = fmt.Errorf("%w%s", waitErr, formatXvfbStderr(stderr.String()))
+				failed = true
+			default:
+			}
+			if failed {
+				break
+			}
+
+			if _, err := os.Stat(socketPath); err == nil {
+				return cmd, display, nil
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		_ = cmd.Process.Kill()
+		waitErr := <-exitCh
+		if waitErr != nil {
+			lastErr = fmt.Errorf("%w%s", waitErr, formatXvfbStderr(stderr.String()))
+		} else {
+			lastErr = fmt.Errorf("timeout waiting for Xvfb socket%s", formatXvfbStderr(stderr.String()))
+		}
+
+	}
+
+	if lastErr != nil {
+		return nil, "", fmt.Errorf("start Xvfb: no usable display found: %w", lastErr)
+	}
+	return nil, "", fmt.Errorf("start Xvfb: no usable display found")
+}
+
+func formatXvfbStderr(stderr string) string {
+	stderr = strings.TrimSpace(stderr)
+	if stderr == "" {
+		return ""
+	}
+	return " | xvfb stderr: " + stderr
 }
