@@ -277,11 +277,19 @@ const settingsPageHTML = `<!DOCTYPE html>
         <p>These settings are applied to newly created browser sessions after save.</p>
         <div class="grid">
           <div class="field full">
-            <label for="browserPath">Browser Path</label>
+            <label for="browserBackend">Browser Backend</label>
+            <select id="browserBackend" name="browserBackend">
+              <option value="auto">auto (detect from browser path)</option>
+              <option value="chromedriver">chromedriver (Chrome / Chromium)</option>
+              <option value="geckodriver">geckodriver (Firefox / Camoufox)</option>
+            </select>
+          </div>
+          <div class="field full">
+            <label for="browserPath">Browser Path <span class="muted">— Chrome or Firefox/Camoufox binary</span></label>
             <input id="browserPath" name="browserPath" type="text" />
           </div>
           <div class="field full">
-            <label for="driverPath">ChromeDriver Path</label>
+            <label for="driverPath">Driver Path <span class="muted">— chromedriver or geckodriver; empty = auto-download</span></label>
             <input id="driverPath" name="driverPath" type="text" />
           </div>
           <div class="field full">
@@ -335,7 +343,7 @@ const settingsPageHTML = `<!DOCTYPE html>
 
   <script>
     const fields = [
-      "host", "port", "browserPath", "driverPath", "driverCacheDir",
+      "host", "port", "browserBackend", "browserPath", "driverPath", "driverCacheDir",
       "driverAutoDownload", "chromeForTestingURL", "headless", "startupUserAgent",
       "logLevel", "logHTML", "disableMedia", "prometheusEnabled",
       "prometheusPort", "proxyURL", "proxyUsername", "proxyPassword"

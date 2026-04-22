@@ -15,6 +15,7 @@ import (
 type Config struct {
 	Host                string
 	Port                int
+	BrowserBackend      string // "auto" | "chromedriver" | "geckodriver"
 	BrowserPath         string
 	DriverPath          string
 	DriverCacheDir      string
@@ -36,6 +37,7 @@ type Config struct {
 type configFile struct {
 	Host                string           `yaml:"host"`
 	Port                int              `yaml:"port"`
+	BrowserBackend      string           `yaml:"browser_backend,omitempty"`
 	BrowserPath         string           `yaml:"browser_path,omitempty"`
 	DriverPath          string           `yaml:"driver_path,omitempty"`
 	DriverCacheDir      string           `yaml:"driver_cache_dir,omitempty"`
@@ -98,6 +100,9 @@ func (c Config) withDefaults() Config {
 	if c.Port == 0 {
 		c.Port = base.Port
 	}
+	if c.BrowserBackend == "" {
+		c.BrowserBackend = base.BrowserBackend
+	}
 	if c.BrowserPath == "" {
 		c.BrowserPath = base.BrowserPath
 	}
@@ -129,6 +134,7 @@ func defaultConfigValues() Config {
 	return Config{
 		Host:                "0.0.0.0",
 		Port:                8191,
+		BrowserBackend:      "auto",
 		BrowserPath:         findChromeBinary(),
 		DriverAutoDownload:  true,
 		ChromeForTestingURL: defaultChromeForTestingBaseURL,
@@ -232,6 +238,7 @@ func configFileFromConfig(cfg Config) configFile {
 	fileCfg := configFile{
 		Host:                cfg.Host,
 		Port:                cfg.Port,
+		BrowserBackend:      cfg.BrowserBackend,
 		BrowserPath:         cfg.BrowserPath,
 		DriverPath:          cfg.DriverPath,
 		DriverCacheDir:      cfg.DriverCacheDir,
@@ -266,6 +273,9 @@ func applyConfigFile(cfg *Config, fileCfg configFile) {
 	}
 	if fileCfg.Port > 0 {
 		cfg.Port = fileCfg.Port
+	}
+	if strings.TrimSpace(fileCfg.BrowserBackend) != "" {
+		cfg.BrowserBackend = canonicalBrowserBackend(fileCfg.BrowserBackend)
 	}
 	if strings.TrimSpace(fileCfg.BrowserPath) != "" {
 		cfg.BrowserPath = fileCfg.BrowserPath
@@ -312,6 +322,9 @@ func applyConfigFile(cfg *Config, fileCfg configFile) {
 func applyEnvConfig(cfg *Config) {
 	cfg.Host = getenv("HOST", cfg.Host)
 	cfg.Port = getenvInt("PORT", cfg.Port)
+	if envBackend := strings.TrimSpace(os.Getenv("BROWSER_BACKEND")); envBackend != "" {
+		cfg.BrowserBackend = canonicalBrowserBackend(envBackend)
+	}
 	cfg.BrowserPath = firstNonEmpty(os.Getenv("BROWSER_PATH"), cfg.BrowserPath)
 	cfg.DriverPath = firstNonEmpty(os.Getenv("DRIVER_PATH"), cfg.DriverPath)
 	cfg.DriverCacheDir = firstNonEmpty(os.Getenv("DRIVER_CACHE_DIR"), cfg.DriverCacheDir)
@@ -356,6 +369,20 @@ func parseLogLevel(raw string) slog.Level {
 		return slog.LevelError
 	default:
 		return slog.LevelInfo
+	}
+}
+
+// canonicalBrowserBackend normalises user-supplied backend names.
+func canonicalBrowserBackend(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "geckodriver", "firefox", "camoufox":
+		return "geckodriver"
+	case "chromedriver", "chrome", "chromium":
+		return "chromedriver"
+	case "", "auto":
+		return "auto"
+	default:
+		return "auto"
 	}
 }
 

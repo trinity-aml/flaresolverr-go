@@ -11,6 +11,7 @@ import (
 type settingsPayload struct {
 	Host                string `json:"host"`
 	Port                int    `json:"port"`
+	BrowserBackend      string `json:"browserBackend"`
 	BrowserPath         string `json:"browserPath"`
 	DriverPath          string `json:"driverPath"`
 	DriverCacheDir      string `json:"driverCacheDir"`
@@ -125,6 +126,7 @@ func settingsPayloadFromConfig(cfg Config) settingsPayload {
 	payload := settingsPayload{
 		Host:                cfg.Host,
 		Port:                cfg.Port,
+		BrowserBackend:      canonicalBrowserBackend(cfg.BrowserBackend),
 		BrowserPath:         cfg.BrowserPath,
 		DriverPath:          cfg.DriverPath,
 		DriverCacheDir:      cfg.DriverCacheDir,
@@ -171,9 +173,15 @@ func (p settingsPayload) toConfig(base Config) (Config, error) {
 		}
 	}
 
+	backend := canonicalBrowserBackend(p.BrowserBackend)
+	if strings.TrimSpace(p.BrowserBackend) != "" && backend == "auto" && strings.ToLower(strings.TrimSpace(p.BrowserBackend)) != "auto" {
+		return Config{}, fmt.Errorf("unsupported browser backend")
+	}
+
 	cfg := base
 	cfg.Host = host
 	cfg.Port = p.Port
+	cfg.BrowserBackend = backend
 	cfg.BrowserPath = strings.TrimSpace(p.BrowserPath)
 	cfg.DriverPath = strings.TrimSpace(p.DriverPath)
 	cfg.DriverCacheDir = strings.TrimSpace(p.DriverCacheDir)

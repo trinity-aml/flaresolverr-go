@@ -374,6 +374,11 @@ func (b *webDriverBrowser) chromeArgs() []string {
 }
 
 func (b *webDriverBrowser) installStealth() error {
+	// Stealth patches applied on every new document to reduce automation
+	// fingerprint signals that CF Managed Challenge uses for botting decisions.
+	// Covers: navigator.webdriver, real PluginArray/MimeTypeArray mimic,
+	// Canvas/WebGL/Audio fingerprint noise, window.chrome, permissions quirk,
+	// Notification stub, and matching sec-ch-ua userAgentData.
 	const stealthScript = `(() => {
 		const safeDefine = (obj, prop, getter) => {
 			if (!obj) return;
@@ -396,19 +401,172 @@ func (b *webDriverBrowser) installStealth() error {
 			});
 		} catch (_) {}
 
-		safeDefine(navigator, 'maxTouchPoints', () => 1);
+		safeDefine(navigator, 'maxTouchPoints', () => 0);
+		safeDefine(navigator, 'hardwareConcurrency', () => 8);
+		safeDefine(navigator, 'deviceMemory', () => 8);
 		if (navigator.connection) {
 			safeDefine(navigator.connection, 'rtt', () => 100);
+			safeDefine(navigator.connection, 'downlink', () => 10);
+			safeDefine(navigator.connection, 'effectiveType', () => '4g');
 		}
 		safeDefine(navigator, 'languages', () => navigator.languages && navigator.languages.length ? navigator.languages : ['en-US', 'en']);
-		safeDefine(navigator, 'plugins', () => navigator.plugins && navigator.plugins.length ? navigator.plugins : [1, 2, 3, 4, 5]);
+
+		// PluginArray / MimeTypeArray — mimic real Chrome PDF plugins so that
+		// CF fingerprinting sees proper Plugin objects (not a number array).
+		try {
+			const makeMime = (type, suffixes, description) => {
+				const mime = Object.create(MimeType.prototype);
+				Object.defineProperty(mime, 'type', { get: () => type });
+				Object.defineProperty(mime, 'suffixes', { get: () => suffixes });
+				Object.defineProperty(mime, 'description', { get: () => description });
+				return mime;
+			};
+			const makePlugin = (name, filename, description, mimes) => {
+				const plugin = Object.create(Plugin.prototype);
+				Object.defineProperty(plugin, 'name', { get: () => name });
+				Object.defineProperty(plugin, 'filename', { get: () => filename });
+				Object.defineProperty(plugin, 'description', { get: () => description });
+				Object.defineProperty(plugin, 'length', { get: () => mimes.length });
+				for (let i = 0; i < mimes.length; i++) {
+					Object.defineProperty(plugin, i, { get: () => mimes[i] });
+					Object.defineProperty(plugin, mimes[i].type, { get: () => mimes[i] });
+					Object.defineProperty(mimes[i], 'enabledPlugin', { get: () => plugin });
+				}
+				return plugin;
+			};
+			const pdfMime = makeMime('application/pdf', 'pdf', 'Portable Document Format');
+			const pluginPdfMime = makeMime('application/x-google-chrome-pdf', 'pdf', 'Portable Document Format');
+			const pdfViewer = makePlugin('PDF Viewer', 'internal-pdf-viewer', 'Portable Document Format', [pdfMime, pluginPdfMime]);
+			const chromePdf = makePlugin('Chrome PDF Viewer', 'internal-pdf-viewer', 'Portable Document Format', [pdfMime, pluginPdfMime]);
+			const chromiumPdf = makePlugin('Chromium PDF Viewer', 'internal-pdf-viewer', 'Portable Document Format', [pdfMime, pluginPdfMime]);
+			const microsoftEdgePdf = makePlugin('Microsoft Edge PDF Viewer', 'internal-pdf-viewer', 'Portable Document Format', [pdfMime, pluginPdfMime]);
+			const webkitPdf = makePlugin('WebKit built-in PDF', 'internal-pdf-viewer', 'Portable Document Format', [pdfMime, pluginPdfMime]);
+			const plugins = [pdfViewer, chromePdf, chromiumPdf, microsoftEdgePdf, webkitPdf];
+			const pluginArray = Object.create(PluginArray.prototype);
+			Object.defineProperty(pluginArray, 'length', { get: () => plugins.length });
+			for (let i = 0; i < plugins.length; i++) {
+				Object.defineProperty(pluginArray, i, { get: () => plugins[i] });
+				Object.defineProperty(pluginArray, plugins[i].name, { get: () => plugins[i] });
+			}
+			pluginArray.item = (i) => plugins[i] || null;
+			pluginArray.namedItem = (name) => plugins.find(p => p.name === name) || null;
+			pluginArray.refresh = () => {};
+			safeDefine(navigator, 'plugins', () => pluginArray);
+
+			const mimes = [pdfMime, pluginPdfMime];
+			const mimeArray = Object.create(MimeTypeArray.prototype);
+			Object.defineProperty(mimeArray, 'length', { get: () => mimes.length });
+			for (let i = 0; i < mimes.length; i++) {
+				Object.defineProperty(mimeArray, i, { get: () => mimes[i] });
+				Object.defineProperty(mimeArray, mimes[i].type, { get: () => mimes[i] });
+			}
+			mimeArray.item = (i) => mimes[i] || null;
+			mimeArray.namedItem = (name) => mimes.find(m => m.type === name) || null;
+			safeDefine(navigator, 'mimeTypes', () => mimeArray);
+		} catch (_) {}
+
+		// userAgentData — return a plausible sec-ch-ua profile (Chrome)
+		try {
+			const brands = [
+				{ brand: 'Not)A;Brand', version: '99' },
+				{ brand: 'Google Chrome', version: '147' },
+				{ brand: 'Chromium', version: '147' },
+			];
+			const uaData = {
+				brands: brands,
+				mobile: false,
+				platform: 'Linux',
+				getHighEntropyValues: (hints) => Promise.resolve({
+					brands: brands,
+					mobile: false,
+					platform: 'Linux',
+					platformVersion: '6.17.0',
+					architecture: 'x86',
+					bitness: '64',
+					model: '',
+					uaFullVersion: '147.0.7727.101',
+					fullVersionList: brands,
+					wow64: false,
+				}),
+				toJSON: () => ({ brands: brands, mobile: false, platform: 'Linux' }),
+			};
+			safeDefine(navigator, 'userAgentData', () => uaData);
+		} catch (_) {}
+
+		// Canvas fingerprint: inject tiny, deterministic-per-document noise into
+		// getImageData so CF can't get a stable canvas hash from our browser.
+		try {
+			const noisify = (canvas, context) => {
+				if (!context || typeof context.getImageData !== 'function') return;
+				const orig = context.getImageData;
+				const seed = (Math.random() * 1e6) | 0;
+				context.getImageData = function(x, y, w, h) {
+					const img = orig.apply(this, arguments);
+					const data = img.data;
+					for (let i = 0; i < data.length; i += 4) {
+						const v = (seed + i) & 0x7;
+						data[i] = data[i] ^ (v & 1);
+						data[i+1] = data[i+1] ^ ((v >> 1) & 1);
+						data[i+2] = data[i+2] ^ ((v >> 2) & 1);
+					}
+					return img;
+				};
+			};
+			const origGetContext = HTMLCanvasElement.prototype.getContext;
+			HTMLCanvasElement.prototype.getContext = function(type) {
+				const ctx = origGetContext.apply(this, arguments);
+				if (type === '2d') noisify(this, ctx);
+				return ctx;
+			};
+			const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+			HTMLCanvasElement.prototype.toDataURL = function() {
+				try {
+					const ctx = this.getContext('2d');
+					if (ctx) noisify(this, ctx);
+				} catch (_) {}
+				return origToDataURL.apply(this, arguments);
+			};
+		} catch (_) {}
+
+		// WebGL: override renderer/vendor unmasked values to look like a real
+		// Intel UHD Graphics rig instead of headless SwiftShader/LLVM.
+		try {
+			const patchGL = (proto) => {
+				if (!proto || !proto.getParameter) return;
+				const orig = proto.getParameter;
+				proto.getParameter = function(parameter) {
+					// UNMASKED_VENDOR_WEBGL = 0x9245
+					if (parameter === 0x9245) return 'Intel Inc.';
+					// UNMASKED_RENDERER_WEBGL = 0x9246
+					if (parameter === 0x9246) return 'Intel(R) UHD Graphics 630';
+					return orig.apply(this, arguments);
+				};
+			};
+			if (typeof WebGLRenderingContext !== 'undefined') patchGL(WebGLRenderingContext.prototype);
+			if (typeof WebGL2RenderingContext !== 'undefined') patchGL(WebGL2RenderingContext.prototype);
+		} catch (_) {}
+
+		// AudioContext fingerprint noise
+		try {
+			if (typeof AnalyserNode !== 'undefined') {
+				const orig = AnalyserNode.prototype.getFloatFrequencyData;
+				AnalyserNode.prototype.getFloatFrequencyData = function(array) {
+					orig.apply(this, arguments);
+					for (let i = 0; i < array.length; i++) {
+						array[i] = array[i] + (Math.random() - 0.5) * 1e-7;
+					}
+				};
+			}
+		} catch (_) {}
 
 		window.chrome = window.chrome || {
-			app: { isInstalled: false },
-			runtime: {},
+			app: { isInstalled: false, InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' }, RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' } },
+			runtime: { OnInstalledReason: {}, OnRestartRequiredReason: {}, PlatformArch: {}, PlatformNaclArch: {}, PlatformOs: {}, RequestUpdateCheckStatus: {} },
+			csi: () => ({ onloadT: Date.now(), startE: Date.now(), pageT: 0, tran: 15 }),
+			loadTimes: () => ({ requestTime: Date.now() / 1000, startLoadTime: Date.now() / 1000, commitLoadTime: Date.now() / 1000, finishDocumentLoadTime: Date.now() / 1000, finishLoadTime: Date.now() / 1000, firstPaintTime: Date.now() / 1000, firstPaintAfterLoadTime: 0, navigationType: 'Other', wasFetchedViaSpdy: true, wasNpnNegotiated: true, npnNegotiatedProtocol: 'h2', wasAlternateProtocolAvailable: false, connectionInfo: 'h2' }),
 		};
 		if (!window.Notification) {
-			window.Notification = { permission: 'denied' };
+			window.Notification = { permission: 'default' };
 		}
 		if (navigator.permissions && navigator.permissions.query) {
 			const originalQuery = navigator.permissions.query.bind(navigator.permissions);
@@ -612,7 +770,18 @@ func (b *webDriverBrowser) setCookies(ctx context.Context, rawURL string, cookie
 func (b *webDriverBrowser) solveChallenge(ctx context.Context) error {
 	b.debugChallengeState(ctx, "challenge-detected")
 
+	// Seed some mouse activity up front. CF Managed Challenge requires
+	// human-like mouse movement signals before it will auto-resolve.
+	_ = b.mouseWiggle(ctx)
+
+	// Managed Challenge Invisible: page shows "Verifying..." with no
+	// interactive Turnstile/checkbox — only helper links (refresh, docs).
+	// Clicking those just refreshes the page and restarts the loop. If we
+	// see this pattern for N consecutive attempts, bail out fast so the
+	// client can fall back rather than burn the full 90s timeout.
+	const passiveBailout = 3
 	attempt := 0
+	passiveStreak := 0
 	for {
 		found, err := b.challengePresent(ctx)
 		if err != nil {
@@ -631,9 +800,53 @@ func (b *webDriverBrowser) solveChallenge(ctx context.Context) error {
 			return nil
 		}
 
+		targets, _ := b.clickTargets(ctx)
+		relevant := relevantChallengeTargets(targets)
+		fallback := fallbackChallengeTargets(targets)
+		if len(relevant) == 0 && len(fallback) == 0 {
+			passiveStreak++
+			b.logger.Debug("managed challenge: no interactive controls",
+				"attempt", attempt, "passive_streak", passiveStreak)
+			if passiveStreak >= passiveBailout {
+				return fmt.Errorf("managed challenge has no interactive controls after %d attempts; browser fingerprint likely blocked", passiveStreak)
+			}
+			// Passive managed challenge: give CF more time with mouse
+			// activity instead of clicking unrelated page links.
+			_ = b.mouseWiggle(ctx)
+			if err := sleepContext(ctx, 3*time.Second); err != nil {
+				return err
+			}
+			continue
+		}
+		passiveStreak = 0
+
 		b.logger.Debug("timeout waiting for challenge to clear", "attempt", attempt)
 		_ = b.clickVerify(ctx, 1)
 	}
+}
+
+// mouseWiggle dispatches a short sequence of mouseMoved CDP events to
+// simulate human-like mouse activity. CF Managed Challenge checks for mouse
+// movement before auto-resolving; a purely static browser gets stuck.
+func (b *webDriverBrowser) mouseWiggle(ctx context.Context) error {
+	pts := []struct{ x, y float64 }{
+		{120, 180}, {260, 240}, {400, 300}, {540, 340},
+		{620, 280}, {480, 220}, {340, 260}, {200, 320},
+	}
+	for _, p := range pts {
+		if _, err := b.executeCDP(ctx, "Input.dispatchMouseEvent", map[string]any{
+			"type":   "mouseMoved",
+			"x":      p.x,
+			"y":      p.y,
+			"button": "none",
+		}); err != nil {
+			return err
+		}
+		if err := sleepContext(ctx, 40*time.Millisecond); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (b *webDriverBrowser) resolveTurnstileToken(ctx context.Context, tabs int) (string, error) {
