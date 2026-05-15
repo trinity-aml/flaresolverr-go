@@ -448,6 +448,20 @@ func (b *geckoBrowser) resolve(ctx context.Context, req Request) (*ChallengeReso
 		message = "Challenge solved!"
 	}
 
+	// Wait BEFORE reading currentURL/cookies/HTML. For request.post the form
+	// submission is driven from a data:URL via JS — at this point the browser
+	// is still navigating from data: to the real target, and reading cookies
+	// now returns an empty jar (the WebDriver /cookie endpoint is scoped to
+	// the current page's origin, which is data: until navigation completes).
+	// Letting WaitInSeconds elapse first ensures the snapshot reflects the
+	// post-navigation state: real currentURL, fully populated cookie jar,
+	// final response HTML.
+	if req.WaitInSeconds > 0 {
+		if err := sleepContext(ctx, time.Duration(req.WaitInSeconds)*time.Second); err != nil {
+			return nil, "", fmt.Errorf("wait after challenge: %w", err)
+		}
+	}
+
 	currentURL, err := b.currentURL(ctx)
 	if err != nil {
 		return nil, "", fmt.Errorf("read current url: %w", err)
@@ -469,11 +483,6 @@ func (b *geckoBrowser) resolve(ctx context.Context, req Request) (*ChallengeReso
 	}
 
 	if !req.ReturnOnlyCookies {
-		if req.WaitInSeconds > 0 {
-			if err := sleepContext(ctx, time.Duration(req.WaitInSeconds)*time.Second); err != nil {
-				return nil, "", fmt.Errorf("wait after challenge: %w", err)
-			}
-		}
 		htmlDoc, err := b.pageHTML(ctx)
 		if err != nil {
 			return nil, "", fmt.Errorf("read response html: %w", err)
