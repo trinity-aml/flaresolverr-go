@@ -492,6 +492,26 @@ func (b *geckoBrowser) resolve(ctx context.Context, req Request) (*ChallengeReso
 	// case and can react accordingly.
 	if token, err := b.readTurnstileToken(ctx); err == nil && token != "" {
 		result.TurnstileToken = token
+	} else if req.TabsTillVerify != nil {
+		// Interactive Turnstile: token didn't auto-populate after wait, so
+		// the widget is in click-to-verify mode. Try a real pointer click at
+		// the widget's screen coordinates. Cloudflare's Turnstile iframe
+		// lives at challenges.cloudflare.com (cross-origin), so we can't
+		// reach into it — but a click on the outer .cf-turnstile container
+		// at the right x,y is forwarded to the iframe by Firefox.
+		if clicked := b.clickTurnstileCheckbox(ctx); clicked {
+			// Give the widget a few seconds to validate after the click,
+			// then re-read the token.
+			_ = sleepContext(ctx, 4*time.Second)
+			if token, err := b.readTurnstileToken(ctx); err == nil && token != "" {
+				result.TurnstileToken = token
+				// Refresh cookies — anti-bot tokens (eb927f21fc_*) are
+				// usually set together with the Turnstile pass.
+				if fresh, err := b.currentCookies(ctx); err == nil && len(fresh) > 0 {
+					result.Cookies = fresh
+				}
+			}
+		}
 	}
 
 	if !req.ReturnOnlyCookies {
@@ -743,6 +763,65 @@ func (b *geckoBrowser) userAgent(ctx context.Context) (string, error) {
 	}
 	b.cachedUserAgent = scrubUserAgent(ua)
 	return b.cachedUserAgent, nil
+}
+
+// clickTurnstileCheckbox sends a real pointer click at the screen-space
+// center of the Turnstile widget. Cloudflare hosts the actual checkbox
+// inside a cross-origin iframe (challenges.cloudflare.com), so we can't
+// dispatch synthetic events at it from page JS — but Firefox forwards a
+// WebDriver Actions pointer click at the right (x, y) coordinates into
+// the iframe just fine. Returns true if a widget was found and clicked.
+func (b *geckoBrowser) clickTurnstileCheckbox(ctx context.Context) bool {
+	const locate = `
+        (function() {
+            var sel = '.cf-turnstile, [data-sitekey], iframe[src*="challenges.cloudflare.com"]';
+            var el = document.querySelector(sel);
+            if (!el) return null;
+            var r = el.getBoundingClientRect();
+            if (r.width < 4 || r.height < 4) return null;
+            // The Turnstile checkbox is anchored on the left side of the
+            // widget — click ~30px from left, vertical center — instead of
+            // dead center, which on wide widgets misses the active area.
+            var cx = Math.round(r.left + Math.min(30, r.width / 2));
+            var cy = Math.round(r.top + r.height / 2);
+            return {x: cx, y: cy, w: r.width, h: r.height};
+        })()
+    `
+	raw, err := b.executeScript(ctx, locate)
+	if err != nil {
+		return false
+	}
+	var pos struct {
+		X int `json:"x"`
+		Y int `json:"y"`
+		W int `json:"w"`
+		H int `json:"h"`
+	}
+	if err := json.Unmarshal(raw, &pos); err != nil || (pos.W == 0 && pos.H == 0) {
+		return false
+	}
+	actions := []map[string]any{
+		{
+			"id":         "turnstile-mouse",
+			"type":       "pointer",
+			"parameters": map[string]any{"pointerType": "mouse"},
+			"actions": []map[string]any{
+				{"type": "pointerMove", "duration": 100, "x": pos.X, "y": pos.Y, "origin": "viewport"},
+				{"type": "pause", "duration": 150},
+				{"type": "pointerDown", "button": 0},
+				{"type": "pause", "duration": 80},
+				{"type": "pointerUp", "button": 0},
+			},
+		},
+	}
+	if _, _, err := b.webDriverRequest(ctx, http.MethodPost, b.sessionPath("/actions"), map[string]any{
+		"actions": actions,
+	}); err != nil {
+		_, _, _ = b.webDriverRequest(ctx, http.MethodDelete, b.sessionPath("/actions"), nil)
+		return false
+	}
+	_, _, _ = b.webDriverRequest(ctx, http.MethodDelete, b.sessionPath("/actions"), nil)
+	return true
 }
 
 // readTurnstileToken returns the value of any cf-turnstile-response input on
