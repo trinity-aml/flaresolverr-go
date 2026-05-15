@@ -482,6 +482,18 @@ func (b *geckoBrowser) resolve(ctx context.Context, req Request) (*ChallengeReso
 		UserAgent: userAgent,
 	}
 
+	// Minimal Turnstile token extraction: when the page has a
+	// cf-turnstile-response input (visible or hidden) we read its value. For
+	// Managed Challenge Invisible widgets the value is populated by the
+	// challenge script on its own — no user interaction needed — so the
+	// snapshot taken after WaitInSeconds catches it. Interactive widgets
+	// (the "click to verify" checkbox) still require a real click and are
+	// not handled here; callers will see an empty TurnstileToken in that
+	// case and can react accordingly.
+	if token, err := b.readTurnstileToken(ctx); err == nil && token != "" {
+		result.TurnstileToken = token
+	}
+
 	if !req.ReturnOnlyCookies {
 		htmlDoc, err := b.pageHTML(ctx)
 		if err != nil {
@@ -731,6 +743,31 @@ func (b *geckoBrowser) userAgent(ctx context.Context) (string, error) {
 	}
 	b.cachedUserAgent = scrubUserAgent(ua)
 	return b.cachedUserAgent, nil
+}
+
+// readTurnstileToken returns the value of any cf-turnstile-response input on
+// the page. Returns "" when no such input exists or the challenge hasn't
+// populated it yet. Walks both the main document and any non-cross-origin
+// iframes (Cloudflare embeds the input in a friendly iframe in some flows).
+func (b *geckoBrowser) readTurnstileToken(ctx context.Context) (string, error) {
+	const script = `
+        (function() {
+            var sel = 'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]';
+            var el = document.querySelector(sel);
+            if (el && el.value) return el.value;
+            var frames = document.querySelectorAll('iframe');
+            for (var i = 0; i < frames.length; i++) {
+                try {
+                    var doc = frames[i].contentDocument;
+                    if (!doc) continue;
+                    var inner = doc.querySelector(sel);
+                    if (inner && inner.value) return inner.value;
+                } catch (_) {}
+            }
+            return '';
+        })()
+    `
+	return b.executeString(ctx, script)
 }
 
 // ---------- execute helpers ----------
