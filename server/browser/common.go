@@ -116,6 +116,15 @@ func AppendWithEnv(env []string, key, value string) []string {
 	return result
 }
 
+// BuildPostFormHTML wraps a form-encoded postData into an auto-submitting
+// HTML form so a WebDriver-driven browser can replay it as a real POST.
+//
+// HTML form inputs hold plain text in name/value attributes — the browser
+// percent-encodes them itself when serializing the submission. Applying
+// url.QueryEscape here as well produced a double-encoded body (e.g. a
+// password "P@ss" arrived at the server as "P%2540ss"), silently failing
+// every login with a non-alphanumeric character. We only need to escape
+// the HTML metacharacters (< > & " ') so the attributes parse correctly.
 func BuildPostFormHTML(targetURL, postData string) string {
 	queryString := strings.TrimPrefix(postData, "?")
 	pairs, _ := url.ParseQuery(queryString)
@@ -130,9 +139,9 @@ func BuildPostFormHTML(targetURL, postData string) string {
 		}
 		for _, value := range values {
 			builder.WriteString(`<input type="text" name="`)
-			builder.WriteString(html.EscapeString(url.QueryEscape(name)))
+			builder.WriteString(html.EscapeString(name))
 			builder.WriteString(`" value="`)
-			builder.WriteString(html.EscapeString(url.QueryEscape(value)))
+			builder.WriteString(html.EscapeString(value))
 			builder.WriteString(`"><br>`)
 		}
 	}

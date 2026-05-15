@@ -662,6 +662,18 @@ func (b *webDriverBrowser) resolve(ctx context.Context, req Request) (*Challenge
 		message = "Challenge solved!"
 	}
 
+	// Wait BEFORE reading currentURL/cookies/HTML. For request.post the form
+	// submission is driven from a data:URL — the browser is still navigating
+	// to the real target when we get here, and the WebDriver /cookie endpoint
+	// is scoped to the current page's origin (data:), so reading the jar now
+	// returns an empty list. Letting WaitInSeconds elapse first lets the
+	// post-navigation snapshot include the real currentURL and cookies.
+	if req.WaitInSeconds > 0 {
+		if err := sleepContext(ctx, time.Duration(req.WaitInSeconds)*time.Second); err != nil {
+			return nil, "", fmt.Errorf("wait after challenge: %w", err)
+		}
+	}
+
 	currentURL, err := b.currentURL(ctx)
 	if err != nil {
 		return nil, "", fmt.Errorf("read current url: %w", err)
@@ -699,11 +711,6 @@ func (b *webDriverBrowser) resolve(ctx context.Context, req Request) (*Challenge
 	}
 
 	if !req.ReturnOnlyCookies {
-		if req.WaitInSeconds > 0 {
-			if err := sleepContext(ctx, time.Duration(req.WaitInSeconds)*time.Second); err != nil {
-				return nil, "", fmt.Errorf("wait after challenge: %w", err)
-			}
-		}
 		htmlDoc, err := b.pageHTML(ctx)
 		if err != nil {
 			return nil, "", fmt.Errorf("read response html: %w", err)

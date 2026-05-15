@@ -686,6 +686,17 @@ func (b *chromedpBrowser) resolve(ctx context.Context, req Request) (*ChallengeR
 		message = "Challenge solved!"
 	}
 
+	// Wait BEFORE reading currentURL/cookies/HTML. For request.post the form
+	// submission is driven from a data:URL — the browser is still navigating
+	// to the real target when we get here, so reading cookies now returns a
+	// jar scoped to data: (i.e. empty). Letting WaitInSeconds elapse first
+	// guarantees the snapshot reflects the post-navigation state.
+	if req.WaitInSeconds > 0 {
+		if err := sleepContext(ctx, time.Duration(req.WaitInSeconds)*time.Second); err != nil {
+			return nil, "", fmt.Errorf("wait after challenge: %w", err)
+		}
+	}
+
 	currentURL, err := b.currentURL(ctx)
 	if err != nil {
 		return nil, "", fmt.Errorf("read current url: %w", err)
@@ -721,11 +732,6 @@ func (b *chromedpBrowser) resolve(ctx context.Context, req Request) (*ChallengeR
 	}
 
 	if !req.ReturnOnlyCookies {
-		if req.WaitInSeconds > 0 {
-			if err := sleepContext(ctx, time.Duration(req.WaitInSeconds)*time.Second); err != nil {
-				return nil, "", fmt.Errorf("wait after challenge: %w", err)
-			}
-		}
 		htmlDoc, err := b.pageHTML(ctx)
 		if err != nil {
 			return nil, "", fmt.Errorf("read response html: %w", err)
