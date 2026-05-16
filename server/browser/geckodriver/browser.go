@@ -492,24 +492,21 @@ func (b *geckoBrowser) resolve(ctx context.Context, req Request) (*ChallengeReso
 	// case and can react accordingly.
 	if token, err := b.readTurnstileToken(ctx); err == nil && token != "" {
 		result.TurnstileToken = token
+		b.logger.Info("turnstile token captured without interaction", "len", len(token))
 	} else if req.TabsTillVerify != nil {
-		// Interactive Turnstile: token didn't auto-populate after wait, so
-		// the widget is in click-to-verify mode. Try a real pointer click at
-		// the widget's screen coordinates. Cloudflare's Turnstile iframe
-		// lives at challenges.cloudflare.com (cross-origin), so we can't
-		// reach into it — but a click on the outer .cf-turnstile container
-		// at the right x,y is forwarded to the iframe by Firefox.
-		if clicked := b.clickTurnstileCheckbox(ctx); clicked {
-			// Give the widget a few seconds to validate after the click,
-			// then re-read the token.
-			_ = sleepContext(ctx, 4*time.Second)
+		b.logger.Info("turnstile token not auto-populated, attempting interactive click")
+		clicked, diag := b.clickTurnstileCheckbox(ctx)
+		b.logger.Info("turnstile click result", "clicked", clicked, "diag", diag)
+		if clicked {
+			_ = sleepContext(ctx, 5*time.Second)
 			if token, err := b.readTurnstileToken(ctx); err == nil && token != "" {
 				result.TurnstileToken = token
-				// Refresh cookies — anti-bot tokens (eb927f21fc_*) are
-				// usually set together with the Turnstile pass.
+				b.logger.Info("turnstile token captured after click", "len", len(token))
 				if fresh, err := b.currentCookies(ctx); err == nil && len(fresh) > 0 {
 					result.Cookies = fresh
 				}
+			} else {
+				b.logger.Info("turnstile token still empty after click")
 			}
 		}
 	}
@@ -771,45 +768,81 @@ func (b *geckoBrowser) userAgent(ctx context.Context) (string, error) {
 // dispatch synthetic events at it from page JS — but Firefox forwards a
 // WebDriver Actions pointer click at the right (x, y) coordinates into
 // the iframe just fine. Returns true if a widget was found and clicked.
-func (b *geckoBrowser) clickTurnstileCheckbox(ctx context.Context) bool {
+func (b *geckoBrowser) clickTurnstileCheckbox(ctx context.Context) (bool, string) {
+	// First locate the widget. We try several candidate selectors and
+	// scroll the chosen element into view before clicking, otherwise the
+	// pointer click lands on background pixels and Cloudflare never sees
+	// the gesture.
 	const locate = `
         (function() {
-            var sel = '.cf-turnstile, [data-sitekey], iframe[src*="challenges.cloudflare.com"]';
-            var el = document.querySelector(sel);
-            if (!el) return null;
-            var r = el.getBoundingClientRect();
-            if (r.width < 4 || r.height < 4) return null;
-            // The Turnstile checkbox is anchored on the left side of the
-            // widget — click ~30px from left, vertical center — instead of
-            // dead center, which on wide widgets misses the active area.
+            var selectors = [
+                'iframe[src*="challenges.cloudflare.com"]',
+                '.cf-turnstile iframe',
+                '.cf-turnstile',
+                '[data-sitekey]'
+            ];
+            var found = null;
+            for (var i = 0; i < selectors.length; i++) {
+                var el = document.querySelector(selectors[i]);
+                if (el) {
+                    var r0 = el.getBoundingClientRect();
+                    if (r0.width >= 4 && r0.height >= 4) {
+                        found = {el: el, sel: selectors[i]};
+                        break;
+                    }
+                }
+            }
+            if (!found) {
+                // Count widgets to help diagnose
+                var cnt = document.querySelectorAll('.cf-turnstile, [data-sitekey], iframe').length;
+                return {error: 'no-widget', iframe_total: cnt};
+            }
+            try {
+                found.el.scrollIntoView({block: 'center', inline: 'center'});
+            } catch (_) {}
+            var r = found.el.getBoundingClientRect();
             var cx = Math.round(r.left + Math.min(30, r.width / 2));
             var cy = Math.round(r.top + r.height / 2);
-            return {x: cx, y: cy, w: r.width, h: r.height};
+            return {selector: found.sel, x: cx, y: cy, w: r.width, h: r.height,
+                    viewportW: window.innerWidth, viewportH: window.innerHeight};
         })()
     `
 	raw, err := b.executeScript(ctx, locate)
 	if err != nil {
-		return false
+		return false, fmt.Sprintf("locate js err: %v", err)
 	}
 	var pos struct {
-		X int `json:"x"`
-		Y int `json:"y"`
-		W int `json:"w"`
-		H int `json:"h"`
+		Selector    string `json:"selector"`
+		Error       string `json:"error"`
+		IframeTotal int    `json:"iframe_total"`
+		X           int    `json:"x"`
+		Y           int    `json:"y"`
+		W           int    `json:"w"`
+		H           int    `json:"h"`
+		ViewportW   int    `json:"viewportW"`
+		ViewportH   int    `json:"viewportH"`
 	}
-	if err := json.Unmarshal(raw, &pos); err != nil || (pos.W == 0 && pos.H == 0) {
-		return false
+	if err := json.Unmarshal(raw, &pos); err != nil {
+		return false, fmt.Sprintf("locate json err: %v raw=%s", err, string(raw))
 	}
+	if pos.Error != "" || (pos.W == 0 && pos.H == 0) {
+		return false, fmt.Sprintf("widget not located: err=%q iframe_total=%d", pos.Error, pos.IframeTotal)
+	}
+	diag := fmt.Sprintf("sel=%s x=%d y=%d w=%d h=%d viewport=%dx%d", pos.Selector, pos.X, pos.Y, pos.W, pos.H, pos.ViewportW, pos.ViewportH)
+
+	// Brief settle after scroll before the click.
+	_ = sleepContext(ctx, 300*time.Millisecond)
+
 	actions := []map[string]any{
 		{
 			"id":         "turnstile-mouse",
 			"type":       "pointer",
 			"parameters": map[string]any{"pointerType": "mouse"},
 			"actions": []map[string]any{
-				{"type": "pointerMove", "duration": 100, "x": pos.X, "y": pos.Y, "origin": "viewport"},
-				{"type": "pause", "duration": 150},
+				{"type": "pointerMove", "duration": 150, "x": pos.X, "y": pos.Y, "origin": "viewport"},
+				{"type": "pause", "duration": 200},
 				{"type": "pointerDown", "button": 0},
-				{"type": "pause", "duration": 80},
+				{"type": "pause", "duration": 120},
 				{"type": "pointerUp", "button": 0},
 			},
 		},
@@ -818,10 +851,10 @@ func (b *geckoBrowser) clickTurnstileCheckbox(ctx context.Context) bool {
 		"actions": actions,
 	}); err != nil {
 		_, _, _ = b.webDriverRequest(ctx, http.MethodDelete, b.sessionPath("/actions"), nil)
-		return false
+		return false, diag + " click-actions err: " + err.Error()
 	}
 	_, _, _ = b.webDriverRequest(ctx, http.MethodDelete, b.sessionPath("/actions"), nil)
-	return true
+	return true, diag
 }
 
 // readTurnstileToken returns the value of any cf-turnstile-response input on
