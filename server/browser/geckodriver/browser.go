@@ -803,7 +803,7 @@ func (b *geckoBrowser) clickTurnstileCheckbox(ctx context.Context) (bool, string
             var r = found.el.getBoundingClientRect();
             var cx = Math.round(r.left + Math.min(30, r.width / 2));
             var cy = Math.round(r.top + r.height / 2);
-            return {selector: found.sel, x: cx, y: cy, w: r.width, h: r.height,
+            return {selector: found.sel, x: cx, y: cy, w: Math.round(r.width), h: Math.round(r.height),
                     viewportW: window.innerWidth, viewportH: window.innerHeight};
         })()
     `
