@@ -197,6 +197,11 @@ func (b *chromedpBrowser) execAllocatorOptions() ([]chromedp.ExecAllocatorOption
 		chromedp.Flag("ignore-ssl-errors", true),
 		chromedp.Flag("remote-allow-origins", "*"),
 		chromedp.Flag("disable-blink-features", "AutomationControlled"),
+		// Cloudflare renders the Turnstile widget inside a *closed* shadow
+		// root, which querySelectorAll and el.shadowRoot cannot see. Stealth
+		// Chromium builds expose it as el.fakeShadowRoot behind this flag;
+		// stock Chrome ignores the unknown feature name.
+		chromedp.Flag("enable-blink-features", "FakeShadowRoot"),
 		chromedp.Flag("no-sandbox", true),
 		chromedp.Flag("start-maximized", true),
 		chromedp.Env(env...),
@@ -1065,8 +1070,9 @@ func (b *chromedpBrowser) focusTarget(ctx context.Context, target clickTarget) e
 			if (!root || visited.has(root) || !root.querySelectorAll) return null;
 			visited.add(root);
 			for (const el of root.querySelectorAll('*')) {
-				if (el.shadowRoot) {
-					const found = walk(el.shadowRoot);
+				const sr = el.fakeShadowRoot || el.shadowRoot;
+				if (sr) {
+					const found = walk(sr);
 					if (found) return found;
 				}
 				if (!visible(el)) continue;
@@ -1209,7 +1215,8 @@ func (b *chromedpBrowser) clickTargets(ctx context.Context) ([]clickTarget, erro
 			if (!root || visited.has(root) || !root.querySelectorAll) return;
 			visited.add(root);
 			for (const el of root.querySelectorAll('*')) {
-				if (el.shadowRoot) walk(el.shadowRoot);
+				const sr = el.fakeShadowRoot || el.shadowRoot;
+				if (sr) walk(sr);
 				const tag = (el.tagName || '').toLowerCase();
 				if (tag === 'iframe' || tag === 'button' || tag === 'input' || tag === 'textarea' || tag === 'select') {
 					pushTarget(el, tag);

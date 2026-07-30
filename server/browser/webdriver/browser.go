@@ -345,6 +345,11 @@ func (b *webDriverBrowser) chromeArgs() []string {
 		"--disable-blink-features=AutomationControlled",
 		"--remote-allow-origins=*",
 		"--start-maximized",
+		// Cloudflare renders the Turnstile widget inside a *closed* shadow
+		// root, which querySelectorAll and el.shadowRoot cannot see. Stealth
+		// Chromium builds expose it as el.fakeShadowRoot behind this flag;
+		// stock Chrome ignores the unknown feature name.
+		"--enable-blink-features=FakeShadowRoot",
 	}
 	if !b.effectiveHeadless && runtime.GOOS != "windows" {
 		args = append(args, "--window-position=-2400,-2400")
@@ -591,13 +596,21 @@ func (b *webDriverBrowser) installStealth() error {
 	if overrideUA == "" {
 		overrideUA = scrubUserAgent(currentUA)
 	}
-	if overrideUA != "" {
-		_, _ = b.executeCDP(context.Background(), "Emulation.setUserAgentOverride", map[string]any{
-			"userAgent":      overrideUA,
-			"acceptLanguage": firstNonEmpty(os.Getenv("LANG"), "en-US"),
-			"platform":       runtime.GOOS,
-		})
+	// Only override when it actually changes the UA — the chromedp backend has
+	// always had this guard and the webdriver one did not. The call is far from
+	// free: with no userAgentMetadata, Chrome re-derives its high-entropy client
+	// hints from the UA string alone, and Cloudflare compares those against the
+	// UA. Measured on rutracker with a stealth Chromium, this no-op override
+	// (same UA in, same UA out) was the entire difference between clearing the
+	// managed challenge in ~7s and looping on it forever.
+	if overrideUA == "" || overrideUA == currentUA {
+		return nil
 	}
+	_, _ = b.executeCDP(context.Background(), "Emulation.setUserAgentOverride", map[string]any{
+		"userAgent":      overrideUA,
+		"acceptLanguage": firstNonEmpty(os.Getenv("LANG"), "en-US"),
+		"platform":       runtime.GOOS,
+	})
 
 	return nil
 }
@@ -1054,8 +1067,9 @@ func (b *webDriverBrowser) focusTarget(ctx context.Context, target clickTarget) 
 			if (!root || visited.has(root) || !root.querySelectorAll) return null;
 			visited.add(root);
 			for (const el of root.querySelectorAll('*')) {
-				if (el.shadowRoot) {
-					const found = walk(el.shadowRoot);
+				const sr = el.fakeShadowRoot || el.shadowRoot;
+				if (sr) {
+					const found = walk(sr);
 					if (found) return found;
 				}
 				if (!visible(el)) continue;
@@ -1283,7 +1297,8 @@ func (b *webDriverBrowser) clickTargets(ctx context.Context) ([]clickTarget, err
 			if (!root || visited.has(root) || !root.querySelectorAll) return;
 			visited.add(root);
 			for (const el of root.querySelectorAll('*')) {
-				if (el.shadowRoot) walk(el.shadowRoot);
+				const sr = el.fakeShadowRoot || el.shadowRoot;
+				if (sr) walk(sr);
 				const tag = (el.tagName || '').toLowerCase();
 				if (tag === 'iframe' || tag === 'button' || tag === 'input' || tag === 'textarea' || tag === 'select') {
 					pushTarget(el, tag);
