@@ -20,6 +20,7 @@ import (
 	"time"
 
 	browserpkg "github.com/trinity-aml/flaresolverr-go/server/browser"
+	"github.com/trinity-aml/flaresolverr-go/server/browser/bidi"
 	"github.com/trinity-aml/flaresolverr-go/server/browser/w3c"
 )
 
@@ -66,6 +67,11 @@ type geckoBrowser struct {
 	keepProfileDir  bool
 	downloadDir     string
 
+	// Only populated when the proxy carries credentials: BiDi is requested,
+	// dialled and kept open solely to answer authentication challenges.
+	webSocketURL string
+	bidiSession  *bidi.Session
+
 	mu sync.Mutex
 }
 
@@ -98,6 +104,12 @@ func NewGeckoDriver(ctx context.Context, cfg Config, proxy *Proxy) (Client, erro
 		return nil, err
 	}
 	if err := b.createSession(ctx); err != nil {
+		_ = b.Close()
+		return nil, err
+	}
+	// Before anything navigates: the first request through an authenticated
+	// proxy is the one that gets the 407.
+	if err := b.enableProxyAuth(ctx); err != nil {
 		_ = b.Close()
 		return nil, err
 	}
@@ -134,6 +146,14 @@ func (b *geckoBrowser) Close() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	// Close the BiDi socket first: it is only useful while the browser is
+	// alive, and leaving it open would keep the read loop blocked on a
+	// connection about to be torn down under it.
+	if b.bidiSession != nil {
+		_ = b.bidiSession.Close()
+		b.bidiSession = nil
+	}
+
 	// DELETE /session tells geckodriver to quit Firefox gracefully.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	b.sess.Delete(ctx)
@@ -167,12 +187,21 @@ func (b *geckoBrowser) startDriver(ctx context.Context) error {
 		env = appendWithEnv(env, "DISPLAY", display)
 	}
 
+	// geckodriver defaults its BiDi listener to a fixed 9222, so two browsers
+	// would fight over it. Give every driver its own, exactly as with the
+	// WebDriver port — even when no session ends up asking for BiDi.
+	wsPort, err := w3c.FreeLocalPort()
+	if err != nil {
+		return fmt.Errorf("reserve geckodriver websocket port: %w", err)
+	}
+
 	spec := w3c.DriverSpec{
 		Name: "geckodriver",
 		Path: b.cfg.DriverPath,
 		Args: []string{
 			"--host", "127.0.0.1",
 			"--port", fmt.Sprintf("%d", port),
+			"--websocket-port", fmt.Sprintf("%d", wsPort),
 			"--binary", b.cfg.BrowserPath,
 		},
 		Env: env,
@@ -239,6 +268,13 @@ func (b *geckoBrowser) createSession(ctx context.Context) error {
 		"moz:firefoxOptions":      firefoxOptions,
 	}
 
+	// Only ask for a BiDi channel when something needs it. Proxy credentials
+	// are the one thing classic WebDriver cannot deliver here.
+	needsBiDi := b.proxy != nil && strings.TrimSpace(b.proxy.Username) != ""
+	if needsBiDi {
+		capabilities["webSocketUrl"] = true
+	}
+
 	if b.proxy != nil && strings.TrimSpace(b.proxy.URL) != "" {
 		proxyCap, err := buildProxyCapability(b.proxy)
 		if err != nil {
@@ -246,15 +282,9 @@ func (b *geckoBrowser) createSession(ctx context.Context) error {
 			// IP, which is the opposite of what configuring a proxy asks for.
 			return fmt.Errorf("configure proxy: %w", err)
 		}
+		// W3C proxy capabilities carry no credentials of their own; those are
+		// supplied over BiDi once the session exists. See enableProxyAuth.
 		capabilities["proxy"] = proxyCap
-		// W3C proxy capabilities carry no credentials, and Firefox answers
-		// the 407 with a modal dialog no WebDriver call can dismiss. The
-		// other two backends do handle auth (MV3 extension for chromedriver,
-		// Fetch.authRequired for chromedp) — say so loudly rather than
-		// letting the user debug a generic challenge timeout.
-		if strings.TrimSpace(b.proxy.Username) != "" || strings.TrimSpace(b.proxy.Password) != "" {
-			b.logger.Warn("geckodriver backend cannot pass proxy credentials; the proxy will be contacted unauthenticated. Use the chromedriver or chromedp backend for authenticated proxies.")
-		}
 	}
 
 	payload := map[string]any{
@@ -272,7 +302,10 @@ func (b *geckoBrowser) createSession(ctx context.Context) error {
 	}
 
 	var created struct {
-		SessionID string `json:"sessionId"`
+		SessionID    string `json:"sessionId"`
+		Capabilities struct {
+			WebSocketURL string `json:"webSocketUrl"`
+		} `json:"capabilities"`
 	}
 	_ = json.Unmarshal(raw, &created)
 
@@ -284,6 +317,39 @@ func (b *geckoBrowser) createSession(ctx context.Context) error {
 		return fmt.Errorf("geckodriver session id missing")
 	}
 	b.sess.ID = sessionID
+
+	if needsBiDi {
+		b.webSocketURL = strings.TrimSpace(created.Capabilities.WebSocketURL)
+		if b.webSocketURL == "" {
+			return fmt.Errorf("geckodriver did not return a webSocketUrl, so proxy credentials cannot be supplied")
+		}
+	}
+	return nil
+}
+
+// enableProxyAuth answers proxy authentication challenges over WebDriver BiDi.
+//
+// Firefox opens a real window prompt for a 407 and classic WebDriver does not
+// see it as an alert, so before this the navigation just timed out and the
+// backend warned that authenticated proxies were unsupported. BiDi delivers the
+// challenge as an event instead. This is the geckodriver counterpart of
+// cdpauth, which does the same job over CDP for the Chromium backends.
+func (b *geckoBrowser) enableProxyAuth(ctx context.Context) error {
+	if b.webSocketURL == "" {
+		return nil
+	}
+
+	session, err := bidi.Dial(ctx, b.webSocketURL)
+	if err != nil {
+		return err
+	}
+	if err := bidi.InstallProxyAuth(ctx, session, b.proxy.Username, b.proxy.Password, b.logger); err != nil {
+		_ = session.Close()
+		return fmt.Errorf("proxy authentication: %w", err)
+	}
+
+	b.bidiSession = session
+	b.logger.Debug("proxy authentication attached over bidi", "url", b.webSocketURL)
 	return nil
 }
 
