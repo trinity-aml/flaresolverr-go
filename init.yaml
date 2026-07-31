@@ -8,6 +8,13 @@
 host: 0.0.0.0
 port: 8191
 
+# auto | chromedriver | geckodriver
+#   auto         - infer from the browser_path binary name (default)
+#   chromedriver - Chrome/Chromium via a patched chromedriver
+#   geckodriver  - Firefox/Camoufox via geckodriver
+# Aliases: chrome/chromium -> chromedriver, firefox/camoufox -> geckodriver.
+browser_backend: auto
+
 browser_path: ""
 driver_path: ""
 driver_cache_dir: ""

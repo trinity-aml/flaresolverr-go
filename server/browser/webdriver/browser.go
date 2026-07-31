@@ -17,6 +17,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	browserpkg "github.com/trinity-aml/flaresolverr-go/server/browser"
@@ -58,17 +59,9 @@ var chromeArgValue = browserpkg.ChromeArgValue
 var normalizeResponseHeaders = browserpkg.NormalizeResponseHeaders
 var urlsEquivalent = browserpkg.URLsEquivalent
 var createTransientDir = browserpkg.CreateTransientDir
+var firstNonEmpty = browserpkg.FirstNonEmpty
 
 var proxyExtensionCacheMu sync.Mutex
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return value
-		}
-	}
-	return ""
-}
 
 const webdriverTabKey = "\uE004"
 
@@ -89,7 +82,7 @@ type webDriverBrowser struct {
 	driverLogPath     string
 	cachedUserAgent   string
 
-	xvfbCmd         *exec.Cmd
+	xvfbProc        *browserpkg.XvfbProcess
 	previousDisplay string
 	userDataDir     string
 	keepUserDataDir bool
@@ -167,12 +160,13 @@ func (b *webDriverBrowser) Close() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	b.deleteSession(context.Background())
-	if b.driverCmd != nil && b.driverCmd.Process != nil {
-		_ = b.driverCmd.Process.Kill()
-		_, _ = b.driverCmd.Process.Wait()
-		b.driverCmd = nil
-	}
+	// Bounded: this runs under b.mu, and destroyAll closes sessions serially, so
+	// a wedged chromedriver would otherwise stall shutdown for the full 30s
+	// httpClient timeout per session.
+	deleteCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	b.deleteSession(deleteCtx)
+	cancel()
+	b.stopDriver()
 	if b.patchedDriverDir != "" {
 		_ = os.RemoveAll(b.patchedDriverDir)
 		b.patchedDriverDir = ""
@@ -190,6 +184,37 @@ func (b *webDriverBrowser) Close() error {
 	b.cleanupUserDataDir()
 	b.stopDisplay()
 	return nil
+}
+
+// stopDriver gives chromedriver a grace period to exit on its own (DELETE
+// /session above asks it to), then escalates to SIGTERM and finally SIGKILL.
+// Killing outright orphans the Chrome child process, which then keeps its
+// user-data-dir alive after we have deleted the parent's scratch dirs.
+func (b *webDriverBrowser) stopDriver() {
+	if b.driverCmd == nil || b.driverCmd.Process == nil {
+		return
+	}
+	done := make(chan error, 1)
+	go func() { done <- b.driverCmd.Wait() }()
+
+	select {
+	case <-done:
+		b.driverCmd = nil
+		return
+	case <-time.After(3 * time.Second):
+	}
+
+	_ = b.driverCmd.Process.Signal(syscall.SIGTERM)
+	select {
+	case <-done:
+		b.driverCmd = nil
+		return
+	case <-time.After(2 * time.Second):
+	}
+
+	_ = b.driverCmd.Process.Kill()
+	<-done
+	b.driverCmd = nil
 }
 
 func (b *webDriverBrowser) preparePatchedDriver() error {
@@ -606,22 +631,33 @@ func (b *webDriverBrowser) installStealth() error {
 	if overrideUA == "" || overrideUA == currentUA {
 		return nil
 	}
-	_, _ = b.executeCDP(context.Background(), "Emulation.setUserAgentOverride", map[string]any{
+	if _, err := b.executeCDP(context.Background(), "Emulation.setUserAgentOverride", map[string]any{
 		"userAgent":      overrideUA,
 		"acceptLanguage": firstNonEmpty(os.Getenv("LANG"), "en-US"),
 		"platform":       runtime.GOOS,
-	})
+	}); err != nil {
+		// Not fatal — the browser is still usable — but per the note above this
+		// is what makes managed challenges clear, so a silent failure looks like
+		// "challenges suddenly stopped solving" with nothing in the log.
+		b.logger.Warn("user agent override failed; managed challenges may loop until timeout", "err", err)
+	}
 
 	return nil
 }
 
 func (b *webDriverBrowser) resolve(ctx context.Context, req Request) (*ChallengeResolutionResult, string, error) {
-	if req.DisableMedia {
-		_, _ = b.executeCDP(ctx, "Network.enable", map[string]any{})
+	// Set the block list on every request, empty when media is allowed. It used
+	// to be applied only when DisableMedia was true and never cleared, so
+	// disableMedia:true on one request kept blocking CSS/images for every later
+	// request on the same session.
+	{
 		urls := make([]string, 0, len(blockedURLs))
-		for _, pattern := range blockedURLs {
-			urls = append(urls, normalizeBlockedPattern(pattern))
+		if req.DisableMedia {
+			for _, pattern := range blockedURLs {
+				urls = append(urls, normalizeBlockedPattern(pattern))
+			}
 		}
+		_, _ = b.executeCDP(ctx, "Network.enable", map[string]any{})
 		_, _ = b.executeCDP(ctx, "Network.setBlockedURLs", map[string]any{"urls": urls})
 	}
 
@@ -1024,84 +1060,14 @@ func (b *webDriverBrowser) clickTabbableChallengeTarget(ctx context.Context, tab
 }
 
 func (b *webDriverBrowser) focusTarget(ctx context.Context, target clickTarget) error {
-	script := fmt.Sprintf(`(() => {
-		const want = {
-			tag: %q,
-			id: %q,
-			name: %q,
-			title: %q,
-			role: %q,
-			ariaLabel: %q,
-			className: %q,
-			left: %f,
-			top: %f,
-			width: %f,
-			height: %f
-		};
-
-		const visible = (el) => {
-			if (!el || !el.getBoundingClientRect) return false;
-			const rect = el.getBoundingClientRect();
-			const style = window.getComputedStyle(el);
-			return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
-		};
-
-		const matches = (el) => {
-			if (!el || !el.getBoundingClientRect) return false;
-			const rect = el.getBoundingClientRect();
-			if ((el.tagName || '').toLowerCase() !== want.tag) return false;
-			if (want.id && el.id !== want.id) return false;
-			if (want.name && (el.getAttribute('name') || '') !== want.name) return false;
-			if (want.title && (el.getAttribute('title') || '') !== want.title) return false;
-			if (want.role && (el.getAttribute('role') || '') !== want.role) return false;
-			if (want.ariaLabel && (el.getAttribute('aria-label') || '') !== want.ariaLabel) return false;
-			if (want.className && (el.className || '') !== want.className) return false;
-			return Math.abs(rect.left - want.left) < 2 &&
-				Math.abs(rect.top - want.top) < 2 &&
-				Math.abs(rect.width - want.width) < 2 &&
-				Math.abs(rect.height - want.height) < 2;
-		};
-
-		const visited = new Set();
-		const walk = (root) => {
-			if (!root || visited.has(root) || !root.querySelectorAll) return null;
-			visited.add(root);
-			for (const el of root.querySelectorAll('*')) {
-				const sr = el.fakeShadowRoot || el.shadowRoot;
-				if (sr) {
-					const found = walk(sr);
-					if (found) return found;
-				}
-				if (!visible(el)) continue;
-				if (matches(el)) return el;
-			}
-			return null;
-		};
-
-		const found = walk(document);
-		if (!found || typeof found.focus !== 'function') return false;
-		found.focus();
-		return true;
-	})()`, target.Tag, target.ID, target.Name, target.Title, target.Role, target.AriaLabel, target.ClassName, target.Left, target.Top, target.Width, target.Height)
+	script := browserpkg.FocusTargetScript(target)
 
 	_, err := b.executeScript(ctx, script)
 	return err
 }
 
 func (b *webDriverBrowser) focusHelperButton(ctx context.Context) error {
-	_, err := b.executeScript(ctx, `(() => {
-		let el = document.getElementById('__flaresolverr-focus');
-		if (!el) {
-			el = document.createElement('button');
-			el.id = '__flaresolverr-focus';
-			el.style.position = 'fixed';
-			el.style.top = '0';
-			el.style.left = '0';
-			document.body.prepend(el);
-		}
-		el.focus();
-		return true;
-	})()`)
+	_, err := b.executeScript(ctx, browserpkg.FocusHelperScript)
 	return err
 }
 
@@ -1261,66 +1227,7 @@ func (b *webDriverBrowser) waitChallengeGone(ctx context.Context, d time.Duratio
 }
 
 func (b *webDriverBrowser) clickTargets(ctx context.Context) ([]clickTarget, error) {
-	raw, err := b.executeScript(ctx, `(() => {
-		const results = [];
-		const visited = new Set();
-
-		const pushTarget = (el, kind) => {
-			if (!el || !el.getBoundingClientRect) return;
-			const rect = el.getBoundingClientRect();
-			const style = window.getComputedStyle(el);
-			const text = kind === 'input' ? (el.value || '') : (el.innerText || el.textContent || '');
-			const tag = (el.tagName || '').toLowerCase();
-			results.push({
-				kind,
-				tag,
-				type: el.getAttribute ? (el.getAttribute('type') || '') : '',
-				text: (text || '').trim(),
-				id: el.id || '',
-				name: el.getAttribute ? (el.getAttribute('name') || '') : '',
-				title: el.getAttribute ? (el.getAttribute('title') || '') : '',
-				ariaLabel: el.getAttribute ? (el.getAttribute('aria-label') || '') : '',
-				role: el.getAttribute ? (el.getAttribute('role') || '') : '',
-				className: typeof el.className === 'string' ? el.className : '',
-				tabIndex: typeof el.tabIndex === 'number' ? el.tabIndex : -1,
-				disabled: !!el.disabled || (el.getAttribute && el.getAttribute('aria-disabled') === 'true'),
-				src: kind === 'iframe' ? (el.src || (el.getAttribute && el.getAttribute('src')) || '') : '',
-				left: rect.left,
-				top: rect.top,
-				width: rect.width,
-				height: rect.height,
-				visible: rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0'
-			});
-		};
-
-		const walk = (root) => {
-			if (!root || visited.has(root) || !root.querySelectorAll) return;
-			visited.add(root);
-			for (const el of root.querySelectorAll('*')) {
-				const sr = el.fakeShadowRoot || el.shadowRoot;
-				if (sr) walk(sr);
-				const tag = (el.tagName || '').toLowerCase();
-				if (tag === 'iframe' || tag === 'button' || tag === 'input' || tag === 'textarea' || tag === 'select') {
-					pushTarget(el, tag);
-					continue;
-				}
-				if (tag === 'a' && el.href) {
-					pushTarget(el, 'anchor');
-					continue;
-				}
-				if (typeof el.tabIndex === 'number' && el.tabIndex >= 0) {
-					pushTarget(el, 'tabindex');
-					continue;
-				}
-				if (el.getAttribute && el.getAttribute('role') === 'button') {
-					pushTarget(el, 'role_button');
-				}
-			}
-		};
-
-		walk(document);
-		return results;
-	})()`)
+	raw, err := b.executeScript(ctx, browserpkg.ClickTargetsScript)
 	if err != nil {
 		return nil, err
 	}
@@ -1336,13 +1243,8 @@ func (b *webDriverBrowser) clickTargets(ctx context.Context) ([]clickTarget, err
 }
 
 func (b *webDriverBrowser) debugChallengeState(ctx context.Context, stage string) {
-	activeElement, _ := b.executeString(ctx, `(() => {
-		const el = document.activeElement;
-		if (!el) return '';
-		const bits = [el.tagName || '', el.id ? ('#' + el.id) : '', el.getAttribute ? (el.getAttribute('name') || '') : ''];
-		return bits.filter(Boolean).join(' ');
-	})()`)
-	hasFocus, _ := b.executeBool(ctx, `document.hasFocus ? document.hasFocus() : true`)
+	activeElement, _ := b.executeString(ctx, browserpkg.ActiveElementScript)
+	hasFocus, _ := b.executeBool(ctx, browserpkg.HasFocusScript)
 
 	targets, err := b.clickTargets(ctx)
 	if err != nil {
@@ -1783,19 +1685,18 @@ func (b *webDriverBrowser) prepareHeadlessMode() (bool, string, error) {
 }
 
 func (b *webDriverBrowser) startDisplay(xvfbPath string) (string, error) {
-	cmd, display, err := browserpkg.StartXvfb(xvfbPath)
+	proc, display, err := browserpkg.StartXvfb(xvfbPath)
 	if err != nil {
 		return "", err
 	}
-	b.xvfbCmd = cmd
+	b.xvfbProc = proc
 	return display, nil
 }
 
 func (b *webDriverBrowser) stopDisplay() {
-	if b.xvfbCmd != nil && b.xvfbCmd.Process != nil {
-		_ = b.xvfbCmd.Process.Kill()
-		_, _ = b.xvfbCmd.Process.Wait()
-		b.xvfbCmd = nil
+	if b.xvfbProc != nil {
+		_ = b.xvfbProc.Stop()
+		b.xvfbProc = nil
 	}
 	if b.previousDisplay == "" {
 		_ = os.Unsetenv("DISPLAY")

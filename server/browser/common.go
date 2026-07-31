@@ -292,6 +292,16 @@ func SummarizeCandidateTargets(targets []ClickTarget) []string {
 	return summary
 }
 
+// ChallengeAutoWaitDuration is how long to idle between click-ladder attempts.
+// Passive challenges (no interactive controls found) get the longer wait — the
+// page is expected to clear itself; an interactive one is retried sooner.
+func ChallengeAutoWaitDuration(relevant []ClickTarget) time.Duration {
+	if len(relevant) == 0 {
+		return 1500 * time.Millisecond
+	}
+	return time.Second
+}
+
 func ClickPointsForTarget(target ClickTarget) []Point {
 	left := target.Left
 	top := target.Top
@@ -371,6 +381,15 @@ func URLsEquivalent(lhs, rhs string) bool {
 	return left == right
 }
 
+func FirstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 func FirstCookiePath(path string) string {
 	if strings.TrimSpace(path) == "" {
 		return "/"
@@ -396,9 +415,34 @@ func SleepContext(ctx context.Context, d time.Duration) error {
 	}
 }
 
-func StartXvfb(xvfbPath string) (*exec.Cmd, string, error) {
-	if cmd, display, err := startXvfbWithDisplayFD(xvfbPath); err == nil {
-		return cmd, display, nil
+// XvfbProcess owns a running Xvfb and the single goroutine waiting on it.
+//
+// Both start strategies below spawn a goroutine blocked in cmd.Wait() to detect
+// an early exit, and that goroutine is still running when they hand the process
+// back. Callers must therefore never call Wait on the process themselves — two
+// concurrent waits race for the same wait4, one gets ECHILD, and the child can
+// be left unreaped. Stop is the only supported teardown.
+type XvfbProcess struct {
+	cmd    *exec.Cmd
+	exitCh <-chan error
+}
+
+// Stop kills Xvfb and reaps it through the goroutine that already owns Wait.
+func (p *XvfbProcess) Stop() error {
+	if p == nil || p.cmd == nil || p.cmd.Process == nil {
+		return nil
+	}
+	_ = p.cmd.Process.Kill()
+	if p.exitCh == nil {
+		_, err := p.cmd.Process.Wait()
+		return err
+	}
+	return <-p.exitCh
+}
+
+func StartXvfb(xvfbPath string) (*XvfbProcess, string, error) {
+	if proc, display, err := startXvfbWithDisplayFD(xvfbPath); err == nil {
+		return proc, display, nil
 	}
 
 	return startXvfbWithRange(xvfbPath)
@@ -500,7 +544,7 @@ func canonicalizeURL(raw string) string {
 	return parsed.String()
 }
 
-func startXvfbWithDisplayFD(xvfbPath string) (*exec.Cmd, string, error) {
+func startXvfbWithDisplayFD(xvfbPath string) (*XvfbProcess, string, error) {
 	reader, writer, err := os.Pipe()
 	if err != nil {
 		return nil, "", fmt.Errorf("create Xvfb pipe: %w", err)
@@ -551,7 +595,7 @@ func startXvfbWithDisplayFD(xvfbPath string) (*exec.Cmd, string, error) {
 
 	select {
 	case display := <-displayCh:
-		return cmd, display, nil
+		return &XvfbProcess{cmd: cmd, exitCh: exitCh}, display, nil
 	case readErr := <-readErrCh:
 		_ = cmd.Process.Kill()
 		<-exitCh
@@ -565,7 +609,7 @@ func startXvfbWithDisplayFD(xvfbPath string) (*exec.Cmd, string, error) {
 	}
 }
 
-func startXvfbWithRange(xvfbPath string) (*exec.Cmd, string, error) {
+func startXvfbWithRange(xvfbPath string) (*XvfbProcess, string, error) {
 	var lastErr error
 
 	for displayNumber := 99; displayNumber < 200; displayNumber++ {
@@ -606,7 +650,7 @@ func startXvfbWithRange(xvfbPath string) (*exec.Cmd, string, error) {
 			}
 
 			if _, err := os.Stat(socketPath); err == nil {
-				return cmd, display, nil
+				return &XvfbProcess{cmd: cmd, exitCh: exitCh}, display, nil
 			}
 			time.Sleep(100 * time.Millisecond)
 		}

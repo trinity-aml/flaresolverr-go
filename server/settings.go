@@ -3,10 +3,52 @@ package flaresolverr
 import (
 	"encoding/json"
 	"fmt"
+	"mime"
 	"net/http"
 	neturl "net/url"
 	"strings"
 )
+
+// maxSettingsBodyBytes caps the settings payload. It is a flat struct of short
+// strings; anything larger is a mistake or an attack.
+const maxSettingsBodyBytes = 64 << 10
+
+// guardStateChangingRequest rejects requests a browser could have been tricked
+// into making on the operator's behalf.
+//
+// /settings and /api/settings intentionally carry no authentication — that is a
+// documented deployment constraint. Without a CSRF guard, though, it is not just
+// "unauthenticated on a trusted LAN", it is remote code execution: a POST with
+// Content-Type: text/plain is a CORS *simple request*, so any page the operator
+// happens to visit can send one with no preflight, point browserPath/driverPath
+// at an executable of its choosing (or chromeForTestingURL at its own host) and
+// have it spawned — and SaveConfig persists that to init.yaml, so it survives a
+// restart.
+//
+// Requiring a JSON content type forces a preflight that the Origin check then
+// fails. Non-browser clients (curl, scripts, the bundled settings UI, which
+// already sends application/json) send no Origin/Sec-Fetch-Site and pass.
+func guardStateChangingRequest(r *http.Request) error {
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		return fmt.Errorf("Content-Type must be application/json")
+	}
+
+	switch r.Header.Get("Sec-Fetch-Site") {
+	case "", "same-origin", "none":
+	default:
+		return fmt.Errorf("cross-origin request rejected")
+	}
+
+	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" {
+		parsed, err := neturl.Parse(origin)
+		if err != nil || !strings.EqualFold(parsed.Host, r.Host) {
+			return fmt.Errorf("cross-origin request rejected")
+		}
+	}
+
+	return nil
+}
 
 type settingsPayload struct {
 	Host                string `json:"host"`
@@ -61,14 +103,27 @@ func (s *Server) handleSettingsAPI(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		defer r.Body.Close()
 
+		if err := guardStateChangingRequest(r); err != nil {
+			writeJSON(w, http.StatusForbidden, map[string]any{
+				"error":       err.Error(),
+				"status_code": http.StatusForbidden,
+			})
+			return
+		}
+
 		var payload settingsPayload
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxSettingsBodyBytes)).Decode(&payload); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{
 				"error":       "invalid json body",
 				"status_code": http.StatusBadRequest,
 			})
 			return
 		}
+
+		// Hold applyMu across snapshot -> save -> apply so concurrent saves
+		// cannot lose an update or interleave their writes to init.yaml.
+		s.applyMu.Lock()
+		defer s.applyMu.Unlock()
 
 		cfg, err := payload.toConfig(s.currentConfig())
 		if err != nil {
@@ -155,11 +210,24 @@ func (p settingsPayload) toConfig(base Config) (Config, error) {
 	if host == "" {
 		return Config{}, fmt.Errorf("host is required")
 	}
-	if p.Port <= 0 {
-		return Config{}, fmt.Errorf("port must be greater than zero")
+	if p.Port <= 0 || p.Port > 65535 {
+		return Config{}, fmt.Errorf("port must be between 1 and 65535")
 	}
-	if p.PrometheusPort <= 0 {
-		return Config{}, fmt.Errorf("prometheus port must be greater than zero")
+	if p.PrometheusPort <= 0 || p.PrometheusPort > 65535 {
+		return Config{}, fmt.Errorf("prometheus port must be between 1 and 65535")
+	}
+	if p.Port == p.PrometheusPort {
+		return Config{}, fmt.Errorf("prometheus port must differ from the server port")
+	}
+
+	// The driver downloaded from this URL is chmod 0755'd and executed, so it
+	// must not be fetchable over a channel an on-path attacker can rewrite.
+	chromeForTestingURL := strings.TrimSpace(p.ChromeForTestingURL)
+	if chromeForTestingURL != "" {
+		parsed, err := neturl.Parse(chromeForTestingURL)
+		if err != nil || parsed.Host == "" || !strings.EqualFold(parsed.Scheme, "https") {
+			return Config{}, fmt.Errorf("chrome for testing url must be an absolute https URL")
+		}
 	}
 
 	logLevel := canonicalLogLevel(p.LogLevel)
@@ -186,7 +254,7 @@ func (p settingsPayload) toConfig(base Config) (Config, error) {
 	cfg.DriverPath = strings.TrimSpace(p.DriverPath)
 	cfg.DriverCacheDir = strings.TrimSpace(p.DriverCacheDir)
 	cfg.DriverAutoDownload = p.DriverAutoDownload
-	cfg.ChromeForTestingURL = strings.TrimSpace(p.ChromeForTestingURL)
+	cfg.ChromeForTestingURL = chromeForTestingURL
 	cfg.Headless = p.Headless
 	cfg.StartupUserAgent = strings.TrimSpace(p.StartupUserAgent)
 	cfg.LogLevel = logLevel

@@ -21,10 +21,10 @@ import (
 const geckoDriverReleasesURL = "https://api.github.com/repos/mozilla/geckodriver/releases/latest"
 
 var (
-	managedGeckoDriverMu      sync.Mutex
-	managedGeckoDriverPathMu  sync.Mutex
-	managedGeckoDriverPath    string
-	geckoDriverHTTPClient     = func() *http.Client {
+	managedGeckoDriverMu     sync.Mutex
+	managedGeckoDriverPathMu sync.Mutex
+	managedGeckoDriverPath   string
+	geckoDriverHTTPClient    = func() *http.Client {
 		return &http.Client{Timeout: 120 * time.Second}
 	}
 )
@@ -209,12 +209,16 @@ func downloadGeckoDriverArchive(ctx context.Context, rawURL, targetPath, binaryN
 		return fmt.Errorf("download geckodriver archive failed with %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
 	}
 
+	// Bound the archive: the extracted binary is chmod 0755'd and executed, and
+	// both extractors buffer in memory.
+	body := io.LimitReader(resp.Body, maxDriverArchiveBytes)
+
 	var binaryData []byte
 	switch archiveExt {
 	case "tar.gz":
-		binaryData, err = extractTarGz(resp.Body, binaryName)
+		binaryData, err = extractTarGz(body, binaryName)
 	case "zip":
-		binaryData, err = extractZipFromStream(resp.Body, binaryName)
+		binaryData, err = extractZipFromStream(body, binaryName)
 	default:
 		return fmt.Errorf("unsupported geckodriver archive extension %q", archiveExt)
 	}
@@ -298,10 +302,13 @@ func extractZipBinary(archiveData []byte, binaryName string) ([]byte, error) {
 
 func managedGeckoDriverCacheDir(cfg Config) (string, error) {
 	if strings.TrimSpace(cfg.DriverCacheDir) != "" {
-		dir := filepath.Join(cfg.DriverCacheDir, "..", "geckodriver")
-		// If DriverCacheDir is a custom path already, put geckodriver next to
-		// chromedriver rather than inside it.
-		if strings.HasSuffix(strings.TrimRight(cfg.DriverCacheDir, "/"), "/chromedriver") {
+		// If DriverCacheDir already points at the chromedriver cache, put
+		// geckodriver *next to* it rather than inside it. filepath.Base handles
+		// both separators — the previous HasSuffix("/chromedriver") test never
+		// matched on Windows, so geckodriver was extracted into the chromedriver
+		// cache there.
+		if strings.EqualFold(filepath.Base(filepath.Clean(cfg.DriverCacheDir)), "chromedriver") {
+			dir := filepath.Join(filepath.Dir(filepath.Clean(cfg.DriverCacheDir)), "geckodriver")
 			if err := os.MkdirAll(dir, 0o755); err != nil {
 				return "", fmt.Errorf("create geckodriver cache dir: %w", err)
 			}

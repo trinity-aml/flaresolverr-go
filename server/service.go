@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	neturl "net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -158,16 +159,17 @@ func (s *Service) cmdSessionsCreate(ctx context.Context, req *V1Request) (V1Resp
 }
 
 func (s *Service) cmdSessionsList() V1Response {
+	ids := s.sessions.ids()
 	return V1Response{
 		Status:   StatusOK,
 		Message:  "",
-		Sessions: s.sessions.ids(),
+		Sessions: &ids,
 	}
 }
 
 func (s *Service) cmdSessionsDestroy(req *V1Request) (V1Response, error) {
 	if !s.sessions.destroy(req.Session) {
-		return V1Response{}, errors.New("The session doesn't exist.")
+		return V1Response{}, errSessionClosed
 	}
 	return V1Response{
 		Status:  StatusOK,
@@ -179,6 +181,13 @@ func (s *Service) cmdRequest(ctx context.Context, req *V1Request, method string)
 	logger := s.currentLogger()
 	if req.URL == "" {
 		return V1Response{}, fmt.Errorf("Request parameter 'url' is mandatory in '%s' command.", req.Cmd)
+	}
+	// Restrict to http(s). The URL is handed to a real browser, so file://,
+	// chrome:// and friends would let a caller read local files or internal
+	// pages and get the rendered HTML back in the response.
+	if parsed, err := neturl.Parse(req.URL); err != nil || parsed.Host == "" ||
+		(!strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https")) {
+		return V1Response{}, errors.New("Request parameter 'url' must be an absolute http or https URL.")
 	}
 	if method == "GET" && req.PostData != "" {
 		return V1Response{}, errors.New("Cannot use 'postBody' when sending a GET request.")
@@ -218,7 +227,6 @@ func (s *Service) resolveChallenge(ctx context.Context, req *V1Request, method s
 		if err != nil {
 			return nil, "", err
 		}
-		client = item.browser
 	} else {
 		cfg := s.runtimeBrowserConfig()
 		proxy := req.Proxy
@@ -249,6 +257,14 @@ func (s *Service) resolveChallenge(ctx context.Context, req *V1Request, method s
 	if item != nil {
 		item.mu.Lock()
 		defer item.mu.Unlock()
+		// destroy/destroyAll (including the one ApplyConfig triggers on every
+		// settings save) can have closed this session between the lookup above
+		// and this lock. Report that as a missing session instead of driving a
+		// dead browser and surfacing a transport error.
+		if item.closed {
+			return nil, "", errSessionClosed
+		}
+		client = item.browser
 	}
 
 	res, err := client.Resolve(ctx, request)

@@ -12,6 +12,12 @@ import (
 	flaresolverr "github.com/trinity-aml/flaresolverr-go/server"
 )
 
+// shutdownTimeout bounds the whole graceful stop. It has to outlast a typical
+// in-flight /v1 solve, otherwise http.Server.Shutdown returns early with a
+// deadline error and the browser cleanup behind it gets less time than it
+// needs to kill the driver processes.
+const shutdownTimeout = 30 * time.Second
+
 func main() {
 	cfg, warnings := flaresolverr.LoadConfig()
 	for _, warning := range warnings {
@@ -28,23 +34,41 @@ func main() {
 	flag.IntVar(&cfg.PrometheusPort, "prometheus-port", cfg.PrometheusPort, "Prometheus exporter port")
 	flag.Parse()
 
-	server := flaresolverr.NewServer(cfg)
+	server, err := flaresolverr.NewServer(cfg)
+	if err != nil {
+		log.Fatalf("start server: %v", err)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// ListenAndServe runs in the goroutine and shutdown runs in main, not the
+	// other way around. Shutdown closes the listener, which makes
+	// ListenAndServe return immediately — so if main were the one blocked on
+	// ListenAndServe it would return and kill the process before Shutdown got
+	// as far as service.Close(), leaking every live browser, driver process
+	// and scratch dir on each SIGTERM.
+	serveErr := make(chan error, 1)
 	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		log.Printf("flaresolverr-go listening on %s:%d", cfg.Host, cfg.Port)
+		serveErr <- server.ListenAndServe()
+	}()
+
+	select {
+	case err := <-serveErr:
+		if err != nil {
+			log.Println(err)
+			os.Exit(1)
+		}
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			log.Printf("shutdown failed: %v", err)
 		}
-	}()
-
-	log.Printf("flaresolverr-go listening on %s:%d", cfg.Host, cfg.Port)
-	if err := server.ListenAndServe(); err != nil {
-		log.Println(err)
-		os.Exit(1)
+		if err := <-serveErr; err != nil {
+			log.Println(err)
+			os.Exit(1)
+		}
 	}
 }

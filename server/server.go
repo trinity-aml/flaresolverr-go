@@ -10,6 +10,11 @@ import (
 	"time"
 )
 
+// maxV1BodyBytes caps a /v1 request body. postData and cookies can be sizeable,
+// so the limit is generous — it exists to stop an unbounded stream being read
+// into memory while handlers may run for minutes.
+const maxV1BodyBytes = 4 << 20
+
 type Server struct {
 	cfg        Config
 	service    *Service
@@ -19,13 +24,19 @@ type Server struct {
 	wg         sync.WaitGroup
 	cfgMu      sync.RWMutex
 	configPath string
+
+	// applyMu serializes the whole read-modify-write of a settings save
+	// (snapshot -> validate -> persist -> apply). cfgMu alone only protects the
+	// individual field accesses, so two concurrent POSTs could interleave and
+	// hand Service and the metrics exporter configs from different snapshots.
+	applyMu sync.Mutex
 }
 
-func NewServer(cfg Config) *Server {
+func NewServer(cfg Config) (*Server, error) {
 	cfg = PrepareConfig(cfg)
 	metrics, err := newMetricsRegistry(cfg)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 	configPath, _ := ResolveConfigPath()
 	server := &Server{
@@ -37,8 +48,15 @@ func NewServer(cfg Config) *Server {
 	server.httpServer = &http.Server{
 		Addr:    cfg.addr(),
 		Handler: server.routes(),
+		// No WriteTimeout on purpose: a /v1 solve legitimately runs for the
+		// caller-supplied maxTimeout, and any fixed value here would cut it off.
+		// The read-side timeouts are what close the slowloris hole.
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
-	return server
+	return server, nil
 }
 
 func (s *Server) Handler() http.Handler {
@@ -56,15 +74,19 @@ func (s *Server) ListenAndServe() error {
 	return err
 }
 
+// Shutdown stops the listener, the metrics exporter and every browser session.
+//
+// Every step runs unconditionally and the errors are joined: httpServer.Shutdown
+// reports ctx.Err() whenever a request is still in flight at the deadline, and a
+// legitimate /v1 solve can easily outlive it. Returning early on that error used
+// to skip service.Close() — the only caller of sessionStore.destroyAll — and
+// leak the browser and driver processes it owns.
 func (s *Server) Shutdown(ctx context.Context) error {
-	if err := s.httpServer.Shutdown(ctx); err != nil {
-		return err
-	}
-	if err := s.metrics.Shutdown(ctx); err != nil {
-		return err
-	}
+	errs := []error{s.httpServer.Shutdown(ctx)}
+	errs = append(errs, s.metrics.Shutdown(ctx))
 	s.wg.Wait()
-	return s.service.Close()
+	errs = append(errs, s.service.Close())
+	return errors.Join(errs...)
 }
 
 func (s *Server) routes() http.Handler {
@@ -114,7 +136,7 @@ func (s *Server) routes() http.Handler {
 		defer r.Body.Close()
 
 		var req V1Request
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxV1BodyBytes)).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{
 				"error":       "invalid json body",
 				"status_code": http.StatusBadRequest,
@@ -163,12 +185,26 @@ func (s *Server) loggerPlugin(next http.Handler) http.Handler {
 func (s *Server) errorPlugin(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
-			if recovered := recover(); recovered != nil {
-				s.currentLogger().Error("panic", "err", recovered)
-				writeJSON(w, http.StatusInternalServerError, map[string]any{
-					"error": fmt.Sprint(recovered),
-				})
+			recovered := recover()
+			if recovered == nil {
+				return
 			}
+			// ErrAbortHandler is the documented way to abort a response
+			// silently; swallowing it here would break that contract.
+			if recovered == http.ErrAbortHandler {
+				panic(recovered)
+			}
+			s.currentLogger().Error("panic", "err", recovered)
+			// If the handler already wrote a status, the response is committed
+			// — appending another header plus a JSON body would emit
+			// "superfluous WriteHeader" and corrupt the payload. Dropping the
+			// connection is the only honest signal left.
+			if writer, ok := w.(*statusWriter); ok && writer.status != 0 {
+				panic(http.ErrAbortHandler)
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error": fmt.Sprint(recovered),
+			})
 		}()
 		next.ServeHTTP(w, r)
 	})

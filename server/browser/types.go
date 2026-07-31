@@ -3,7 +3,6 @@ package browser
 import (
 	"context"
 	"log/slog"
-	"strings"
 )
 
 type Config struct {
@@ -80,13 +79,4 @@ type Client interface {
 	UserAgent(context.Context) (string, error)
 	Resolve(context.Context, Request) (*Result, error)
 	Close() error
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return value
-		}
-	}
-	return ""
 }

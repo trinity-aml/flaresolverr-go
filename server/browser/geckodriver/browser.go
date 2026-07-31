@@ -36,26 +36,18 @@ type Result = browserpkg.Result
 type Client = browserpkg.Client
 
 var (
-	appendWithEnv        = browserpkg.AppendWithEnv
-	buildPostFormHTML    = browserpkg.BuildPostFormHTML
-	scrubUserAgent       = browserpkg.ScrubUserAgent
-	firstCookiePath      = browserpkg.FirstCookiePath
-	sleepContext         = browserpkg.SleepContext
-	accessDeniedTitles   = browserpkg.AccessDeniedTitles
+	appendWithEnv         = browserpkg.AppendWithEnv
+	buildPostFormHTML     = browserpkg.BuildPostFormHTML
+	scrubUserAgent        = browserpkg.ScrubUserAgent
+	firstCookiePath       = browserpkg.FirstCookiePath
+	sleepContext          = browserpkg.SleepContext
+	accessDeniedTitles    = browserpkg.AccessDeniedTitles
 	accessDeniedSelectors = browserpkg.AccessDeniedSelectors
-	challengeTitles      = browserpkg.ChallengeTitles
-	challengeSelectors   = browserpkg.ChallengeSelectors
-	createTransientDir   = browserpkg.CreateTransientDir
+	challengeTitles       = browserpkg.ChallengeTitles
+	challengeSelectors    = browserpkg.ChallengeSelectors
+	createTransientDir    = browserpkg.CreateTransientDir
+	firstNonEmpty         = browserpkg.FirstNonEmpty
 )
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return value
-		}
-	}
-	return ""
-}
 
 type geckoBrowser struct {
 	cfg    Config
@@ -67,12 +59,13 @@ type geckoBrowser struct {
 	sessionID         string
 	effectiveHeadless bool
 
-	driverCmd       *exec.Cmd
+	driverCmd        *exec.Cmd
 	driverRuntimeDir string
-	driverLogPath   string
-	cachedUserAgent string
+	driverLogPath    string
+	driverLogFile    *os.File
+	cachedUserAgent  string
 
-	xvfbCmd         *exec.Cmd
+	xvfbProc        *browserpkg.XvfbProcess
 	previousDisplay string
 	profileDir      string
 	keepProfileDir  bool
@@ -150,6 +143,10 @@ func (b *geckoBrowser) Close() error {
 	b.deleteSession(ctx)
 	cancel()
 	b.stopDriver()
+	if b.driverLogFile != nil {
+		_ = b.driverLogFile.Close()
+		b.driverLogFile = nil
+	}
 	if b.driverRuntimeDir != "" {
 		_ = os.RemoveAll(b.driverRuntimeDir)
 		b.driverRuntimeDir = ""
@@ -232,6 +229,9 @@ func (b *geckoBrowser) startDriver() error {
 		}
 		cmd.Stdout = logFile
 		cmd.Stderr = logFile
+		// Kept on the struct so Close can release it. Without this the fd is
+		// leaked for every browser instance whenever debug logging is on.
+		b.driverLogFile = logFile
 	}
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start geckodriver: %w", err)
@@ -287,8 +287,8 @@ func (b *geckoBrowser) createSession() error {
 	}
 
 	capabilities := map[string]any{
-		"browserName":             "firefox",
-		"acceptInsecureCerts":     true,
+		"browserName":         "firefox",
+		"acceptInsecureCerts": true,
 		// eager (vs normal): return from navigate() once DOMContentLoaded
 		// fires, without waiting for the full load event. This matters when
 		// the target URL is actually a file download (.torrent etc.) —
@@ -302,8 +302,16 @@ func (b *geckoBrowser) createSession() error {
 	if b.proxy != nil && strings.TrimSpace(b.proxy.URL) != "" {
 		if proxyCap, err := buildProxyCapability(b.proxy); err == nil && proxyCap != nil {
 			capabilities["proxy"] = proxyCap
+			// W3C proxy capabilities carry no credentials, and Firefox answers
+			// the 407 with a modal dialog no WebDriver call can dismiss. The
+			// other two backends do handle auth (MV3 extension for chromedriver,
+			// Fetch.authRequired for chromedp) — say so loudly rather than
+			// letting the user debug a generic challenge timeout.
+			if strings.TrimSpace(b.proxy.Username) != "" || strings.TrimSpace(b.proxy.Password) != "" {
+				b.logger.Warn("geckodriver backend cannot pass proxy credentials; the proxy will be contacted unauthenticated. Use the chromedriver or chromedp backend for authenticated proxies.")
+			}
 		} else if err != nil {
-			b.logger.Warn("ignoring proxy: %s", err)
+			b.logger.Warn("ignoring proxy", "err", err)
 		}
 	}
 
@@ -358,31 +366,31 @@ func (b *geckoBrowser) firefoxArgs() []string {
 
 func (b *geckoBrowser) firefoxPrefs() map[string]any {
 	prefs := map[string]any{
-		"dom.webdriver.enabled":                        false,
-		"useAutomationExtension":                       false,
-		"dom.webnotifications.enabled":                 false,
-		"app.update.enabled":                           false,
-		"datareporting.healthreport.uploadEnabled":     false,
-		"datareporting.policy.dataSubmissionEnabled":   false,
-		"browser.startup.homepage_override.mstone":     "ignore",
-		"browser.startup.page":                         0,
-		"browser.newtabpage.enabled":                   false,
-		"browser.shell.checkDefaultBrowser":            false,
-		"network.cookie.cookieBehavior":                0, // accept all
-		"privacy.trackingprotection.enabled":           false,
-		"security.OCSP.enabled":                        0,
+		"dom.webdriver.enabled":                      false,
+		"useAutomationExtension":                     false,
+		"dom.webnotifications.enabled":               false,
+		"app.update.enabled":                         false,
+		"datareporting.healthreport.uploadEnabled":   false,
+		"datareporting.policy.dataSubmissionEnabled": false,
+		"browser.startup.homepage_override.mstone":   "ignore",
+		"browser.startup.page":                       0,
+		"browser.newtabpage.enabled":                 false,
+		"browser.shell.checkDefaultBrowser":          false,
+		"network.cookie.cookieBehavior":              0, // accept all
+		"privacy.trackingprotection.enabled":         false,
+		"security.OCSP.enabled":                      0,
 		// Download handling: auto-save to our profile's downloads dir without
 		// a dialog for common attachment types. Without these, navigating to a
 		// URL that serves Content-Disposition: attachment (e.g. a .torrent)
 		// opens a modal save dialog that webdriver cannot dismiss, hanging the
 		// session until the outer timeout.
-		"browser.download.folderList":                   2,
-		"browser.download.useDownloadDir":               true,
-		"browser.download.manager.showWhenStarting":     false,
-		"browser.download.alwaysOpenPanel":              false,
-		"browser.helperApps.alwaysAsk.force":            false,
-		"browser.helperApps.neverAsk.saveToDisk":        "application/x-bittorrent,application/octet-stream,application/x-msdownload,application/zip,application/x-zip-compressed",
-		"pdfjs.disabled":                                true,
+		"browser.download.folderList":               2,
+		"browser.download.useDownloadDir":           true,
+		"browser.download.manager.showWhenStarting": false,
+		"browser.download.alwaysOpenPanel":          false,
+		"browser.helperApps.alwaysAsk.force":        false,
+		"browser.helperApps.neverAsk.saveToDisk":    "application/x-bittorrent,application/octet-stream,application/x-msdownload,application/zip,application/x-zip-compressed",
+		"pdfjs.disabled":                            true,
 	}
 	if dir := strings.TrimSpace(b.downloadDir); dir != "" {
 		prefs["browser.download.dir"] = dir
@@ -1021,19 +1029,18 @@ func (b *geckoBrowser) prepareHeadlessMode() (bool, string, error) {
 		b.logger.Warn("HEADLESS=true without DISPLAY or Xvfb; falling back to Firefox -headless mode")
 		return true, "", nil
 	}
-	cmd, display, err := browserpkg.StartXvfb(xvfbPath)
+	proc, display, err := browserpkg.StartXvfb(xvfbPath)
 	if err != nil {
 		return false, "", err
 	}
-	b.xvfbCmd = cmd
+	b.xvfbProc = proc
 	return false, display, nil
 }
 
 func (b *geckoBrowser) stopDisplay() {
-	if b.xvfbCmd != nil && b.xvfbCmd.Process != nil {
-		_ = b.xvfbCmd.Process.Kill()
-		_, _ = b.xvfbCmd.Process.Wait()
-		b.xvfbCmd = nil
+	if b.xvfbProc != nil {
+		_ = b.xvfbProc.Stop()
+		b.xvfbProc = nil
 	}
 }
 
@@ -1110,10 +1117,10 @@ func buildProxyCapability(p *Proxy) (map[string]any, error) {
 	switch scheme {
 	case "http", "https", "":
 		return map[string]any{
-			"proxyType":       "manual",
-			"httpProxy":       hostPort,
-			"sslProxy":        hostPort,
-			"noProxy":         []string{"localhost", "127.0.0.1"},
+			"proxyType": "manual",
+			"httpProxy": hostPort,
+			"sslProxy":  hostPort,
+			"noProxy":   []string{"localhost", "127.0.0.1"},
 		}, nil
 	case "socks5", "socks4":
 		version := 5
@@ -1121,10 +1128,10 @@ func buildProxyCapability(p *Proxy) (map[string]any, error) {
 			version = 4
 		}
 		return map[string]any{
-			"proxyType":     "manual",
-			"socksProxy":    hostPort,
-			"socksVersion":  version,
-			"noProxy":       []string{"localhost", "127.0.0.1"},
+			"proxyType":    "manual",
+			"socksProxy":   hostPort,
+			"socksVersion": version,
+			"noProxy":      []string{"localhost", "127.0.0.1"},
 		}, nil
 	default:
 		return nil, fmt.Errorf("unsupported proxy scheme %q", scheme)

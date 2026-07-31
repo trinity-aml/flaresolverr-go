@@ -223,12 +223,27 @@ func saveConfigToPath(path string, cfg Config) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create init.yaml directory: %w", err)
 	}
-	tempPath := path + ".tmp"
-	if err := os.WriteFile(tempPath, data, 0o644); err != nil {
+	// A unique temp file in the target directory, not a fixed path+".tmp":
+	// two concurrent saves sharing one temp name can interleave truncate and
+	// write, and whichever renames second publishes a half-written init.yaml.
+	temp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("write init.yaml: %w", err)
+	}
+	tempPath := temp.Name()
+	defer func() { _ = os.Remove(tempPath) }()
+
+	if _, err := temp.Write(data); err != nil {
+		_ = temp.Close()
+		return fmt.Errorf("write init.yaml: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return fmt.Errorf("write init.yaml: %w", err)
+	}
+	if err := os.Chmod(tempPath, 0o644); err != nil {
 		return fmt.Errorf("write init.yaml: %w", err)
 	}
 	if err := os.Rename(tempPath, path); err != nil {
-		_ = os.Remove(tempPath)
 		return fmt.Errorf("replace init.yaml: %w", err)
 	}
 	return nil
@@ -297,6 +312,12 @@ func applyConfigFile(cfg *Config, fileCfg configFile) {
 	}
 	if strings.TrimSpace(fileCfg.StartupUserAgent) != "" {
 		cfg.StartupUserAgent = fileCfg.StartupUserAgent
+	}
+	// log_level was written by SaveConfig but never read back here, so setting
+	// the level from /settings appeared to work and was silently lost on the
+	// next start.
+	if strings.TrimSpace(fileCfg.LogLevel) != "" {
+		cfg.LogLevel = canonicalLogLevel(fileCfg.LogLevel)
 	}
 	if fileCfg.LogHTML != nil {
 		cfg.LogHTML = *fileCfg.LogHTML

@@ -26,17 +26,44 @@ Go-порт [FlareSolverr](https://github.com/FlareSolverr/FlareSolverr) с со
 
 - HTTP API, session/storage и browser runtime реализованы на Go
 - основной код модуля находится в каталоге `server/`
-- browser runtime разнесён по `server/browser/chromedp` и `server/browser/webdriver`, общий слой лежит в `server/browser`
-- основной runtime: Chrome/Chromium + patched `chromedriver` через WebDriver
-- если системного `chromedriver` нет, драйвер подбирается по версии локального Chrome и кэшируется локально
-- fallback runtime: `chromedp`, если `chromedriver` недоступен и auto-download не сработал
-- на Linux при `HEADLESS=true` используется скрытый headful-режим через `DISPLAY` или `Xvfb`, иначе проект откатывается к обычному Chrome headless
+- browser runtime разнесён по `server/browser/webdriver`, `server/browser/geckodriver` и
+  `server/browser/chromedp`; общий слой (селекторы, эвристики кликов, разделяемый JS) лежит в
+  `server/browser`
+- на Linux при `HEADLESS=true` используется скрытый headful-режим через `DISPLAY` или `Xvfb`, иначе
+  проект откатывается к обычному Chrome headless
+
+### Browser backends
+
+Доступны три реализации одного интерфейса `browser.Client`:
+
+| backend | транспорт | браузер | когда используется |
+| --- | --- | --- | --- |
+| `chromedriver` | W3C WebDriver поверх пропатченного `chromedriver` | Chrome / Chromium | по умолчанию |
+| `geckodriver` | W3C WebDriver поверх `geckodriver` | Firefox / [Camoufox](https://github.com/daijro/camoufox) | если выбран явно или найден только Firefox |
+| `chromedp` | CDP напрямую | Chrome / Chromium | автоматический fallback, если `chromedriver` недоступен |
+
+Выбор делает `browser_backend` (`BROWSER_BACKEND`):
+
+- `auto` (по умолчанию) — backend выводится из имени бинарника в `browser_path`
+- `chromedriver` — синонимы `chrome`, `chromium`
+- `geckodriver` — синонимы `firefox`, `camoufox`
+
+`chromedp` нельзя выбрать явно: это резервный путь, на который проект переходит сам, если
+`chromedriver` не найден и auto-download не сработал.
+
+Драйверы скачиваются автоматически при `driver_auto_download: true`: `chromedriver` — по версии
+локального Chrome из Chrome for Testing, `geckodriver` — последний релиз с GitHub. Оба кэшируются
+локально.
+
+**Ограничение geckodriver-бэкенда:** W3C proxy capabilities не передают логин/пароль, поэтому
+аутентифицированные прокси на нём не работают (в лог пишется предупреждение). Для них используйте
+`chromedriver` или `chromedp`.
 
 ## Зависимости
 
 - Go `1.26+`
-- установленный Chrome/Chromium
-- установленный `chromedriver` необязателен
+- установленный Chrome/Chromium — либо Firefox/Camoufox для geckodriver-бэкенда
+- установленные `chromedriver` / `geckodriver` необязательны
 - `Xvfb` опционально для Linux `HEADLESS=true`, если нет активного `DISPLAY`
 
 ## Запуск
@@ -115,6 +142,7 @@ curl -sS http://127.0.0.1:8191/api/settings
 ## Переменные окружения
 
 - `HOST`, `PORT`
+- `BROWSER_BACKEND` — `auto` / `chromedriver` / `geckodriver`
 - `BROWSER_PATH`
 - `DRIVER_PATH`
 - `DRIVER_AUTO_DOWNLOAD`
@@ -123,20 +151,47 @@ curl -sS http://127.0.0.1:8191/api/settings
 - `HEADLESS`
 - `DISABLE_MEDIA`
 - `LOG_HTML`
+- `STARTUP_USER_AGENT` — фиксированный UA для всех новых браузеров
 - `PROMETHEUS_ENABLED`
 - `PROMETHEUS_PORT`
 - `PROXY_URL`, `PROXY_USERNAME`, `PROXY_PASSWORD`
 - `LOG_LEVEL`
 
+Дополнительно читаются, но не имеют аналога в `init.yaml`:
+
+- `CHROME_ARGS` — дополнительные флаги командной строки Chrome (chromedriver и chromedp)
+- `FIREFOX_ARGS` — то же для Firefox/Camoufox (geckodriver)
+- `FLARESOLVERR_TMPDIR` — корень для временных каталогов (профили, user-data-dir, логи драйвера,
+  proxy-расширение). Порядок выбора: `FLARESOLVERR_TMPDIR` → `XDG_RUNTIME_DIR` → `/dev/shm`
+- `DISPLAY` — если задан, переиспользуется вместо запуска своего `Xvfb`
+- `LANG` — пробрасывается в `--accept-lang` / `--lang`
+
+### Поля запроса `/v1`
+
+Помимо стандартных полей FlareSolverr (`cmd`, `url`, `session`, `maxTimeout`, `cookies`,
+`postData`, `returnOnlyCookies`, `returnScreenshot`, `waitInSeconds`, `disableMedia`) поддерживаются:
+
+- `session_ttl_minutes` — если сессия старше указанного TTL, браузер пересоздаётся на следующем
+  запросе
+- `tabs_till_verify` — сколько раз нажать Tab перед активацией элемента челленджа
+
 ## Безопасность
 
-У web UI и `/api/settings` сейчас нет встроенной аутентификации.
+У web UI и `/api/settings` **нет встроенной аутентификации** — это осознанное решение, рассчитанное
+на развёртывание в доверенной сети.
 
-Если сервис доступен не только локально:
+От CSRF защита есть: `POST /api/settings` требует `Content-Type: application/json` и отклоняет
+кросс-сайтовые `Origin` / `Sec-Fetch-Site`. Без этого любая страница, открытая в браузере на той же
+машине, могла бы подменить `browser_path` / `driver_path` и добиться выполнения произвольного
+бинарника. `chrome_for_testing_url` принимается только по `https`, а размер скачиваемого архива
+драйвера ограничен.
+
+Это не заменяет сетевого ограничения доступа. Если сервис доступен не только локально:
 
 - не публикуй `/settings` и `/api/settings` напрямую в интернет
 - ограничивай доступ firewall'ом, reverse proxy ACL или VPN
 - при необходимости выноси UI только на внутренний интерфейс
+- учитывай, что `GET /api/settings` отдаёт пароль прокси в открытом виде
 
 ## Сборка
 
@@ -152,6 +207,29 @@ curl -sS http://127.0.0.1:8191/api/settings
 - `darwin`: `amd64`, `arm64`
 - `windows`: `amd64`, `arm64`, `386`
 - `freebsd`: `amd64`, `arm64`
+
+Рядом с бинарниками пишется `SHA256SUMS`.
+
+Версия проставляется на этапе линковки из `git describe --tags`. Её можно задать явно:
+
+```bash
+VERSION=v1.0.7 ./build_all.sh
+```
+
+Вне git-репозитория используется значение, вшитое в `internal/buildinfo/version.go`.
+
+## Тесты
+
+```bash
+go test ./...          # unit-тесты
+go test -race ./...    # то же с детектором гонок
+go vet ./...
+gofmt -l ./cmd ./server ./internal   # должно быть пусто
+```
+
+Тесты покрывают чистую логику (конфиг, настройки, метрики, хелперы challenge-пайплайна) и
+`sessionStore` с подставным browser factory — браузер для них не нужен. Сам обход Cloudflare
+проверяется вручную против живого сайта.
 
 ## systemd
 

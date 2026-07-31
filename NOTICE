@@ -1,0 +1,34 @@
+flaresolverr-go
+Copyright (c) trinity-aml
+
+This project is a Go port of FlareSolverr (https://github.com/FlareSolverr/FlareSolverr),
+originally written in Python and distributed under the MIT License.
+
+The HTTP API (`/`, `/health`, `/v1`), its request/response shapes, the command
+semantics (`sessions.create`, `sessions.list`, `sessions.destroy`, `request.get`,
+`request.post`) and the challenge-detection selectors are derived from that project.
+
+flaresolverr-go itself is distributed under the GNU General Public License v3.0;
+see the LICENSE file.
+
+Upstream FlareSolverr MIT License notice:
+
+    Copyright (c) 2021-present FlareSolverr
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.

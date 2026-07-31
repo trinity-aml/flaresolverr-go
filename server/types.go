@@ -34,10 +34,15 @@ type V1Request struct {
 type ChallengeResolutionResult = browserpkg.ChallengeResolutionResult
 
 type V1Response struct {
-	Status         string                     `json:"status"`
-	Message        string                     `json:"message"`
-	Session        string                     `json:"session,omitempty"`
-	Sessions       []string                   `json:"sessions,omitempty"`
+	Status  string `json:"status"`
+	Message string `json:"message"`
+	Session string `json:"session,omitempty"`
+	// A pointer, so that sessions.list can emit "sessions": [] for an empty
+	// store while every other command omits the key entirely — which is what
+	// Python does, since it only ever assigns the attribute for sessions.list.
+	// A plain []string with omitempty drops the key for nil and [] alike and
+	// breaks clients that index into it.
+	Sessions       *[]string                  `json:"sessions,omitempty"`
 	StartTimestamp int64                      `json:"startTimestamp,omitempty"`
 	EndTimestamp   int64                      `json:"endTimestamp,omitempty"`
 	Version        string                     `json:"version,omitempty"`

@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -93,24 +94,35 @@ func (m *metricsRegistry) ApplyConfig(ctx context.Context, wg *sync.WaitGroup, l
 	}
 	m.enabled = cfg.PrometheusEnabled
 	m.port = cfg.PrometheusPort
-	if cfg.PrometheusEnabled && m.server == nil {
+	needsServer := cfg.PrometheusEnabled && m.server == nil
+	if needsServer {
 		newServer = &http.Server{
-			Addr:    fmt.Sprintf("0.0.0.0:%d", cfg.PrometheusPort),
-			Handler: m.handler,
+			Addr:              fmt.Sprintf("0.0.0.0:%d", cfg.PrometheusPort),
+			Handler:           m.handler,
+			ReadHeaderTimeout: 10 * time.Second,
 		}
-		m.server = newServer
 	}
 	m.mu.Unlock()
 
+	var shutdownErr error
 	if oldServer != nil {
-		if err := oldServer.Shutdown(ctx); err != nil {
-			return err
-		}
+		shutdownErr = oldServer.Shutdown(ctx)
 	}
+
 	if newServer != nil {
+		// m.server is published only once the listener goroutine is running.
+		// Storing it before the (possibly failing) Shutdown above meant a
+		// shutdown error left m.server pointing at a server that was never
+		// started, and every later ApplyConfig then saw a non-nil m.server and
+		// skipped creating one — the exporter stayed dead until a restart while
+		// /api/settings still reported the port as active.
+		m.mu.Lock()
+		m.server = newServer
+		m.mu.Unlock()
 		m.startServer(wg, logger, newServer)
 	}
-	return nil
+
+	return shutdownErr
 }
 
 func (m *metricsRegistry) Shutdown(ctx context.Context) error {

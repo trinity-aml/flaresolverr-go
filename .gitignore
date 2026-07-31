@@ -2,6 +2,11 @@
 .gocache
 .codex
 Dist
-./flaresolverr
+
+# Leading "./" is not a valid gitignore pattern — git ignored this line, and a
+# stray root-level binary was committed (and later removed) because of it.
+/flaresolverr
+/flaresolverr.exe
+
 .claude
 CLAUDE.md

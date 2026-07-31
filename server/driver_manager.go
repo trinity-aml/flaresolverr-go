@@ -150,6 +150,7 @@ func detectChromeVersion(ctx context.Context, browserPath string) (string, error
 		}
 	}
 
+	var lastErr error
 	for _, args := range [][]string{{"--product-version"}, {"--version"}} {
 		runCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		output, err := exec.CommandContext(runCtx, browserPath, args...).CombinedOutput()
@@ -161,11 +162,16 @@ func detectChromeVersion(ctx context.Context, browserPath string) (string, error
 			}
 			return version, nil
 		}
-		if err == nil {
-			continue
+		if err != nil {
+			lastErr = err
 		}
 	}
-	return "", fmt.Errorf("detect chrome version from %q failed", browserPath)
+	// Carry the exec error: "permission denied" and "binary crashed" need very
+	// different fixes, and the bare message named neither.
+	if lastErr != nil {
+		return "", fmt.Errorf("detect chrome version from %q failed: %w", browserPath, lastErr)
+	}
+	return "", fmt.Errorf("detect chrome version from %q failed: no version in output", browserPath)
 }
 
 func parseChromeVersionOutput(raw string) string {
@@ -222,29 +228,14 @@ func resolveChromeDriverDownloadURL(ctx context.Context, cfg Config, driverVersi
 }
 
 func fetchChromeForTestingText(ctx context.Context, rawURL string) (string, error) {
+	// This used to retry with a byte-for-byte identical second GET on failure,
+	// which could never succeed where the first had not — it only doubled the
+	// request count on every miss.
 	body, err := fetchChromeForTestingJSON(ctx, rawURL)
-	if err == nil {
-		return string(body), nil
+	if err != nil {
+		return "", err
 	}
-
-	req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-	if reqErr != nil {
-		return "", reqErr
-	}
-	resp, respErr := chromeForTestingHTTPClient().Do(req)
-	if respErr != nil {
-		return "", respErr
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		data, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("chrome for testing request %s failed with %d: %s", rawURL, resp.StatusCode, strings.TrimSpace(string(data)))
-	}
-	data, readErr := io.ReadAll(resp.Body)
-	if readErr != nil {
-		return "", readErr
-	}
-	return string(data), nil
+	return string(body), nil
 }
 
 func fetchChromeForTestingJSON(ctx context.Context, rawURL string) ([]byte, error) {
@@ -391,6 +382,10 @@ func chromeMajor(version string) (string, error) {
 	return parts[0], nil
 }
 
+// maxDriverArchiveBytes caps a downloaded driver archive. Real chromedriver and
+// geckodriver archives are well under 20 MB.
+const maxDriverArchiveBytes = 256 << 20
+
 func downloadChromeDriverArchive(ctx context.Context, rawURL, targetPath, binaryName string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
@@ -405,9 +400,15 @@ func downloadChromeDriverArchive(ctx context.Context, rawURL, targetPath, binary
 		data, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("download chromedriver archive failed with %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
 	}
-	archiveData, err := io.ReadAll(resp.Body)
+	// The archive is read fully into memory, so it needs a hard ceiling — the
+	// URL is operator-configurable and a hostile or broken server could
+	// otherwise stream until the process is OOM-killed.
+	archiveData, err := io.ReadAll(io.LimitReader(resp.Body, maxDriverArchiveBytes))
 	if err != nil {
 		return err
+	}
+	if int64(len(archiveData)) >= maxDriverArchiveBytes {
+		return fmt.Errorf("chromedriver archive exceeds %d bytes", maxDriverArchiveBytes)
 	}
 
 	reader, err := zip.NewReader(bytes.NewReader(archiveData), int64(len(archiveData)))
