@@ -652,6 +652,10 @@ func (b *webDriverBrowser) SolveChallenge(ctx context.Context) error {
 	return b.solveChallenge(ctx)
 }
 
+func (b *webDriverBrowser) DocumentReady(ctx context.Context) (bool, error) {
+	return b.sess.ExecuteBool(ctx, browserpkg.DocumentReadyScript)
+}
+
 func (b *webDriverBrowser) DocumentResponse(ctx context.Context, currentURL string) (documentResponse, error) {
 	return b.documentResponse(ctx, currentURL)
 }

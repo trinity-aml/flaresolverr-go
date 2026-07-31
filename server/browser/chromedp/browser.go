@@ -651,6 +651,14 @@ func (b *chromedpBrowser) SolveChallenge(ctx context.Context) error {
 	return b.solveChallenge(ctx)
 }
 
+func (b *chromedpBrowser) DocumentReady(ctx context.Context) (bool, error) {
+	var ready bool
+	if err := chromedp.Run(ctx, chromedp.Evaluate(browserpkg.DocumentReadyScript, &ready)); err != nil {
+		return false, err
+	}
+	return ready, nil
+}
+
 func (b *chromedpBrowser) DocumentResponse(_ context.Context, currentURL string) (documentResponse, error) {
 	return b.documentResponse(currentURL), nil
 }

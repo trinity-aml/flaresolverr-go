@@ -173,3 +173,10 @@ const ActiveElementScript = `(() => {
 
 // HasFocusScript reports whether the document currently holds focus.
 const HasFocusScript = `document.hasFocus ? document.hasFocus() : true`
+
+// DocumentReadyScript reports whether the page has finished parsing.
+//
+// document.body is checked alongside readyState because a navigation that has
+// been triggered but not yet committed still reports the *previous* document's
+// "complete" — which is exactly the state right after a challenge clears.
+const DocumentReadyScript = `document.readyState === 'complete' && !!document.body`

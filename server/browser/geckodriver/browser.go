@@ -240,18 +240,20 @@ func (b *geckoBrowser) createSession(ctx context.Context) error {
 	}
 
 	if b.proxy != nil && strings.TrimSpace(b.proxy.URL) != "" {
-		if proxyCap, err := buildProxyCapability(b.proxy); err == nil && proxyCap != nil {
-			capabilities["proxy"] = proxyCap
-			// W3C proxy capabilities carry no credentials, and Firefox answers
-			// the 407 with a modal dialog no WebDriver call can dismiss. The
-			// other two backends do handle auth (MV3 extension for chromedriver,
-			// Fetch.authRequired for chromedp) — say so loudly rather than
-			// letting the user debug a generic challenge timeout.
-			if strings.TrimSpace(b.proxy.Username) != "" || strings.TrimSpace(b.proxy.Password) != "" {
-				b.logger.Warn("geckodriver backend cannot pass proxy credentials; the proxy will be contacted unauthenticated. Use the chromedriver or chromedp backend for authenticated proxies.")
-			}
-		} else if err != nil {
-			b.logger.Warn("ignoring proxy", "err", err)
+		proxyCap, err := buildProxyCapability(b.proxy)
+		if err != nil {
+			// Never continue without it: the request would go out over the real
+			// IP, which is the opposite of what configuring a proxy asks for.
+			return fmt.Errorf("configure proxy: %w", err)
+		}
+		capabilities["proxy"] = proxyCap
+		// W3C proxy capabilities carry no credentials, and Firefox answers
+		// the 407 with a modal dialog no WebDriver call can dismiss. The
+		// other two backends do handle auth (MV3 extension for chromedriver,
+		// Fetch.authRequired for chromedp) — say so loudly rather than
+		// letting the user debug a generic challenge timeout.
+		if strings.TrimSpace(b.proxy.Username) != "" || strings.TrimSpace(b.proxy.Password) != "" {
+			b.logger.Warn("geckodriver backend cannot pass proxy credentials; the proxy will be contacted unauthenticated. Use the chromedriver or chromedp backend for authenticated proxies.")
 		}
 	}
 
@@ -407,6 +409,10 @@ func (b *geckoBrowser) SolveChallenge(ctx context.Context) error {
 	return b.solveChallenge(ctx)
 }
 
+func (b *geckoBrowser) DocumentReady(ctx context.Context) (bool, error) {
+	return b.sess.ExecuteBool(ctx, browserpkg.DocumentReadyScript)
+}
+
 // DocumentResponse returns a zero value: geckodriver exposes no cheap way to
 // read the real HTTP status, so the pipeline keeps its 200 default.
 func (b *geckoBrowser) DocumentResponse(context.Context, string) (documentResponse, error) {
@@ -498,7 +504,6 @@ func (b *geckoBrowser) solveChallenge(ctx context.Context) error {
 			return err
 		}
 		if !found {
-			b.awaitDocumentReady(ctx)
 			return nil
 		}
 
@@ -514,43 +519,6 @@ func (b *geckoBrowser) solveChallenge(ctx context.Context) error {
 		}
 	}
 	return fmt.Errorf("cloudflare challenge did not clear within %d seconds (%d checkbox click attempts)", maxAttempts, clickAttempts)
-}
-
-// awaitDocumentReady waits for the destination page to finish parsing before
-// the pipeline snapshots it.
-//
-// Clearing a challenge ends in a navigation to the real page, and the challenge
-// stops being detectable the moment that navigation starts — so without this
-// the snapshot can catch a document that has only got as far as </head>.
-// Measured on a live interactive challenge: the response was 1.4 KB with no
-// <body> at waitInSeconds=0 and the full 12 KB page at waitInSeconds=2. Waiting
-// on the page's own state beats making callers guess a sleep.
-//
-// Every exit is a plain return: this only improves what the caller is about to
-// read, so a driver that will not answer is a reason to stop waiting, never a
-// reason to fail a solve that already succeeded.
-func (b *geckoBrowser) awaitDocumentReady(ctx context.Context) {
-	const (
-		budget = 10 * time.Second
-		poll   = 200 * time.Millisecond
-	)
-
-	deadline := time.Now().Add(budget)
-	for time.Now().Before(deadline) {
-		// document.body is checked alongside readyState because a document that
-		// has not started loading yet still reports the previous "complete".
-		ready, err := b.sess.ExecuteBool(ctx, `document.readyState === 'complete' && !!document.body`)
-		if err != nil {
-			return
-		}
-		if ready {
-			return
-		}
-		if err := sleepContext(ctx, poll); err != nil {
-			return
-		}
-	}
-	b.logger.Debug("page still loading when the challenge cleared", "waited", budget)
 }
 
 // mouseWiggle sends a short sequence of mouse moves via the W3C Actions API.
@@ -858,31 +826,16 @@ func splitArgs(raw string) []string {
 }
 
 func buildProxyCapability(p *Proxy) (map[string]any, error) {
-	raw := strings.TrimSpace(p.URL)
-	if raw == "" {
+	if strings.TrimSpace(p.URL) == "" {
 		return nil, nil
 	}
-	parsed, err := url.Parse(raw)
+	scheme, hostPort, err := browserpkg.ParseProxyURL(p.URL)
 	if err != nil {
-		return nil, fmt.Errorf("parse proxy url: %w", err)
+		return nil, err
 	}
-	host := parsed.Hostname()
-	port := parsed.Port()
-	if host == "" || port == "" {
-		return nil, fmt.Errorf("proxy url missing host:port")
-	}
-	hostPort := host + ":" + port
 
-	scheme := strings.ToLower(parsed.Scheme)
 	switch scheme {
-	case "http", "https", "":
-		return map[string]any{
-			"proxyType": "manual",
-			"httpProxy": hostPort,
-			"sslProxy":  hostPort,
-			"noProxy":   []string{"localhost", "127.0.0.1"},
-		}, nil
-	case "socks5", "socks4":
+	case "socks4", "socks5":
 		version := 5
 		if scheme == "socks4" {
 			version = 4
@@ -894,6 +847,11 @@ func buildProxyCapability(p *Proxy) (map[string]any, error) {
 			"noProxy":      []string{"localhost", "127.0.0.1"},
 		}, nil
 	default:
-		return nil, fmt.Errorf("unsupported proxy scheme %q", scheme)
+		return map[string]any{
+			"proxyType": "manual",
+			"httpProxy": hostPort,
+			"sslProxy":  hostPort,
+			"noProxy":   []string{"localhost", "127.0.0.1"},
+		}, nil
 	}
 }

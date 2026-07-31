@@ -40,6 +40,11 @@ type Page interface {
 	ChallengePresent(ctx context.Context) (bool, error)
 	SolveChallenge(ctx context.Context) error
 
+	// DocumentReady reports whether the page has finished parsing. It is a bare
+	// predicate on purpose: the polling budget is pipeline policy, so the loop
+	// lives in awaitDocumentReady and a backend only has to answer the question.
+	DocumentReady(ctx context.Context) (bool, error)
+
 	// DocumentResponse reports the real HTTP status and headers of the main
 	// document. A backend with no way to obtain them returns a zero value and
 	// the pipeline keeps the 200 default.
@@ -59,6 +64,39 @@ type Page interface {
 // accessDeniedError is the message the Python original returns, kept verbatim
 // for wire compatibility.
 const accessDeniedError = "Cloudflare has blocked this request. Probably your IP is banned for this site, check in your web browser."
+
+const (
+	// documentReadyBudget caps the wait for a page to finish parsing. It is
+	// generous because the alternative — snapshotting a half-parsed document —
+	// is silent data loss, while overshooting only costs latency on a page that
+	// was going to be slow anyway.
+	documentReadyBudget = 10 * time.Second
+	documentReadyPoll   = 200 * time.Millisecond
+)
+
+// awaitDocumentReady blocks until the page reports itself parsed, the budget
+// runs out, or the backend stops answering.
+//
+// Every exit is silent by design: this only improves what the caller is about
+// to read, so a backend that cannot answer is a reason to stop waiting, never a
+// reason to fail a request that has otherwise succeeded.
+func awaitDocumentReady(ctx context.Context, p Page, logger Logger) {
+	deadline := time.Now().Add(documentReadyBudget)
+	for time.Now().Before(deadline) {
+		ready, err := p.DocumentReady(ctx)
+		if err != nil {
+			logger.Debug("document readiness probe failed", "err", err)
+			return
+		}
+		if ready {
+			return
+		}
+		if err := SleepContext(ctx, documentReadyPoll); err != nil {
+			return
+		}
+	}
+	logger.Debug("page still loading when the pipeline was ready to read it", "waited", documentReadyBudget)
+}
 
 // ResolvePage runs the challenge pipeline that all three backends share:
 // block media → navigate → (cookies → renavigate) → access-denied check →
@@ -121,6 +159,19 @@ func ResolvePage(ctx context.Context, p Page, req Request) (*ChallengeResolution
 		}
 		message = "Challenge solved!"
 	}
+
+	// Clearing a challenge ends in a navigation to the real page, and the
+	// challenge stops being detectable the moment that navigation *starts* — so
+	// without this the snapshot below can catch a document that has only got as
+	// far as </head>. Measured on a live interactive challenge: 1.4 KB with no
+	// <body> against the full 12 KB page.
+	//
+	// This runs unconditionally rather than only after a solve. Our own Navigate
+	// already blocks until the load event, so with no challenge the first probe
+	// answers true and costs one round-trip; but a passive challenge that
+	// redirects without ChallengePresent ever seeing it lands in exactly the
+	// same race, and that path would otherwise stay uncovered.
+	awaitDocumentReady(ctx, p, logger)
 
 	// Wait BEFORE reading currentURL/cookies/HTML. For request.post the form
 	// submission is driven from a data: URL — the browser is still navigating

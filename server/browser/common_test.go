@@ -277,3 +277,65 @@ func TestNormalizeResponseHeadersLowercasesKeys(t *testing.T) {
 		t.Errorf("expected lowercased x-ray-id, got %v", got)
 	}
 }
+
+func TestParseProxyURL(t *testing.T) {
+	tests := []struct {
+		name       string
+		raw        string
+		wantScheme string
+		wantHost   string
+	}{
+		{"http", "http://proxy.example:8080", "http", "proxy.example:8080"},
+		{"https", "https://proxy.example:443", "https", "proxy.example:443"},
+		{"socks5", "socks5://10.0.0.1:1080", "socks5", "10.0.0.1:1080"},
+		{"socks4", "SOCKS4://10.0.0.1:1080", "socks4", "10.0.0.1:1080"},
+		// A bare host:port is what --proxy-server accepts and what people put
+		// in config files; geckodriver used to reject it and go direct.
+		{"bare host:port", "1.2.3.4:3128", "http", "1.2.3.4:3128"},
+		{"credentials are ignored here", "http://user:pw@proxy.example:8080", "http", "proxy.example:8080"},
+		{"surrounding space", "  http://proxy.example:8080  ", "http", "proxy.example:8080"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme, hostPort, err := ParseProxyURL(tc.raw)
+			if err != nil {
+				t.Fatalf("ParseProxyURL(%q): %v", tc.raw, err)
+			}
+			if scheme != tc.wantScheme || hostPort != tc.wantHost {
+				t.Errorf("= (%q, %q), want (%q, %q)", scheme, hostPort, tc.wantScheme, tc.wantHost)
+			}
+		})
+	}
+}
+
+func TestParseProxyURLRejects(t *testing.T) {
+	for _, raw := range []string{
+		"",
+		"   ",
+		"http://proxy.example",   // no port
+		"ftp://proxy.example:21", // unsupported scheme
+		"socks5h://proxy.example:1080",
+		"http://:8080", // no host
+	} {
+		if _, _, err := ParseProxyURL(raw); err == nil {
+			t.Errorf("ParseProxyURL(%q) accepted an unusable proxy", raw)
+		}
+	}
+}
+
+// An unusable proxy must be fatal: falling back to a direct connection sends
+// the request over the real IP, which is what configuring a proxy asks to avoid.
+func TestValidateProxy(t *testing.T) {
+	if err := ValidateProxy(nil); err != nil {
+		t.Errorf("a nil proxy means no proxy, got %v", err)
+	}
+	if err := ValidateProxy(&Proxy{}); err != nil {
+		t.Errorf("an empty proxy means no proxy, got %v", err)
+	}
+	if err := ValidateProxy(&Proxy{URL: "http://proxy.example:8080"}); err != nil {
+		t.Errorf("valid proxy rejected: %v", err)
+	}
+	if err := ValidateProxy(&Proxy{URL: "not a url at all"}); err == nil {
+		t.Error("a malformed proxy url must be rejected, not silently ignored")
+	}
+}

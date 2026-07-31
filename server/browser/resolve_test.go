@@ -29,6 +29,12 @@ type fakePage struct {
 	mediaBlocked []bool
 	turnstile    string
 	navCount     int
+
+	// notReadyFor makes DocumentReady report "still parsing" that many times
+	// before it reports ready; readyProbes counts how often it was asked.
+	notReadyFor int
+	readyProbes int
+	docReadyErr error
 }
 
 func newFakePage() *fakePage {
@@ -103,6 +109,14 @@ func (p *fakePage) ApplyTurnstileToken(_ context.Context, _ Request, result *Cha
 	result.TurnstileToken = p.turnstile
 	return nil
 }
+func (p *fakePage) DocumentReady(context.Context) (bool, error) {
+	p.record("DocumentReady")
+	p.readyProbes++
+	if p.docReadyErr != nil {
+		return false, p.docReadyErr
+	}
+	return p.readyProbes > p.notReadyFor, nil
+}
 func (p *fakePage) PageLogger() Logger      { return discardLogger{} }
 func (p *fakePage) LogHTMLConfigured() bool { return p.logHTML }
 
@@ -137,6 +151,47 @@ func TestResolvePageHappyPath(t *testing.T) {
 	}
 	if len(result.Cookies) != 1 {
 		t.Errorf("cookies = %v", result.Cookies)
+	}
+}
+
+// Reading the page before it has finished parsing returns a document that stops
+// at </head>. Seen live: a solved challenge answered 1.4 KB with no <body>.
+func TestResolvePageWaitsForTheDocumentBeforeSnapshotting(t *testing.T) {
+	p := newFakePage()
+	p.notReadyFor = 2
+
+	if _, _, err := ResolvePage(context.Background(), p, Request{URL: "u"}); err != nil {
+		t.Fatalf("ResolvePage: %v", err)
+	}
+	if p.readyProbes != 3 {
+		t.Errorf("DocumentReady probed %d times, want it to poll until ready", p.readyProbes)
+	}
+
+	// The whole point is ordering: every read of the settled page must come
+	// after the document is done parsing.
+	ready := indexOf(p.calls, "DocumentReady")
+	for _, after := range []string{"CurrentURL", "PageCookies", "HTML"} {
+		if i := indexOf(p.calls, after); i < ready {
+			t.Errorf("%s ran at %d, before DocumentReady at %d: %v", after, i, ready, p.calls)
+		}
+	}
+}
+
+// The wait only improves what the pipeline is about to read, so a backend that
+// cannot answer must not fail a request that has otherwise succeeded.
+func TestResolvePageSurvivesADocumentReadyFailure(t *testing.T) {
+	p := newFakePage()
+	p.docReadyErr = errors.New("driver went away")
+
+	result, _, err := ResolvePage(context.Background(), p, Request{URL: "u"})
+	if err != nil {
+		t.Fatalf("a readiness probe failure must not fail the request: %v", err)
+	}
+	if result.Response != "<html>ok</html>" {
+		t.Errorf("response = %q", result.Response)
+	}
+	if p.readyProbes != 1 {
+		t.Errorf("probed %d times, want it to give up after the first error", p.readyProbes)
 	}
 }
 

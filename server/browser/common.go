@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -94,6 +95,62 @@ type DocumentResponse struct {
 	URL     string
 	Status  int
 	Headers map[string]string
+}
+
+// ProxySchemes are the proxy URL schemes the backends can actually honour.
+var ProxySchemes = []string{"http", "https", "socks4", "socks5"}
+
+// ParseProxyURL validates a proxy URL and splits it into scheme and host:port.
+//
+// A URL with no scheme is accepted as http: that is what Chrome's
+// --proxy-server does with a bare host:port, and what people write in config
+// files. geckodriver used to reject that form and fall back to a direct
+// connection, so the two engines disagreed on the same setting.
+func ParseProxyURL(raw string) (scheme, hostPort string, err error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", fmt.Errorf("proxy url is empty")
+	}
+
+	// url.Parse would read the host of a bare "host:port" as the scheme.
+	candidate := raw
+	if !strings.Contains(candidate, "://") {
+		candidate = "http://" + candidate
+	}
+	parsed, err := url.Parse(candidate)
+	if err != nil {
+		return "", "", fmt.Errorf("proxy url %q is not a valid URL: %w", raw, err)
+	}
+
+	scheme = strings.ToLower(parsed.Scheme)
+	if !slices.Contains(ProxySchemes, scheme) {
+		return "", "", fmt.Errorf("proxy url %q uses unsupported scheme %q, expected one of %s",
+			raw, scheme, strings.Join(ProxySchemes, ", "))
+	}
+
+	host, port := parsed.Hostname(), parsed.Port()
+	if host == "" || port == "" {
+		return "", "", fmt.Errorf("proxy url %q must include both host and port", raw)
+	}
+	return scheme, host + ":" + port, nil
+}
+
+// ValidateProxy reports whether a proxy configuration is one the backends can
+// honour. A nil or empty proxy is valid — it means "no proxy".
+//
+// Callers are expected to treat a failure as fatal. An unusable proxy used to
+// be non-fatal everywhere: geckodriver logged "ignoring proxy", and the Chromium
+// backends handed the malformed string to --proxy-server, which Chrome quietly
+// drops. All three then sent the request over the real IP — the one outcome
+// somebody who configured a proxy would least want, announced only by a log
+// line they were never going to read. Failing is visible and recoverable; a
+// leaked IP is neither.
+func ValidateProxy(p *Proxy) error {
+	if p == nil || strings.TrimSpace(p.URL) == "" {
+		return nil
+	}
+	_, _, err := ParseProxyURL(p.URL)
+	return err
 }
 
 func AppendWithEnv(env []string, key, value string) []string {

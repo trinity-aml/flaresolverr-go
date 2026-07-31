@@ -29,6 +29,13 @@ func (defaultBrowserFactory) New(ctx context.Context, cfg Config, proxy *Proxy) 
 		Logger:              cfg.Logger,
 	}
 
+	// Validated once here rather than per backend, so an unusable proxy fails
+	// the same way everywhere instead of each engine deciding for itself
+	// whether to quietly go direct. See browserpkg.ValidateProxy.
+	if err := browserpkg.ValidateProxy(proxy); err != nil {
+		return nil, fmt.Errorf("unusable proxy: %w (refusing to fall back to a direct connection)", err)
+	}
+
 	backend := resolveBrowserBackend(cfg)
 	cfg.Logger.Info("selected browser backend", "backend", backend)
 
