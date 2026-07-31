@@ -2,8 +2,6 @@ package webdriverbackend
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -17,6 +15,7 @@ import (
 	"time"
 
 	browserpkg "github.com/trinity-aml/flaresolverr-go/server/browser"
+	"github.com/trinity-aml/flaresolverr-go/server/browser/cdpauth"
 	"github.com/trinity-aml/flaresolverr-go/server/browser/w3c"
 )
 
@@ -58,8 +57,6 @@ var urlsEquivalent = browserpkg.URLsEquivalent
 var createTransientDir = browserpkg.CreateTransientDir
 var firstNonEmpty = browserpkg.FirstNonEmpty
 
-var proxyExtensionCacheMu sync.Mutex
-
 const webdriverTabKey = "\uE004"
 
 type webDriverBrowser struct {
@@ -80,9 +77,12 @@ type webDriverBrowser struct {
 	previousDisplay string
 	userDataDir     string
 	keepUserDataDir bool
-	proxyExtDir     string
-	keepProxyExtDir bool
 	perfLogPath     string
+
+	// debuggerAddress is chromedriver's DevTools endpoint for this browser;
+	// proxyAuthDetach closes the CDP connection opened onto it.
+	debuggerAddress string
+	proxyAuthDetach context.CancelFunc
 
 	mu sync.Mutex
 }
@@ -102,10 +102,6 @@ func NewWebDriver(ctx context.Context, cfg Config, proxy *Proxy) (Client, error)
 	if err := b.prepareUserDataDir(); err != nil {
 		return nil, err
 	}
-	if err := b.prepareProxyExtension(); err != nil {
-		_ = b.Close()
-		return nil, err
-	}
 	if err := b.preparePatchedDriver(); err != nil {
 		_ = b.Close()
 		return nil, err
@@ -115,6 +111,12 @@ func NewWebDriver(ctx context.Context, cfg Config, proxy *Proxy) (Client, error)
 		return nil, err
 	}
 	if err := b.createSession(ctx); err != nil {
+		_ = b.Close()
+		return nil, err
+	}
+	// Before anything navigates: the first request through an authenticated
+	// proxy is the one that gets the 407.
+	if err := b.enableProxyAuth(); err != nil {
 		_ = b.Close()
 		return nil, err
 	}
@@ -170,11 +172,11 @@ func (b *webDriverBrowser) Close() error {
 		_ = os.RemoveAll(b.driverRuntimeDir)
 		b.driverRuntimeDir = ""
 	}
-	if b.proxyExtDir != "" {
-		if !b.keepProxyExtDir {
-			_ = os.RemoveAll(b.proxyExtDir)
-		}
-		b.proxyExtDir = ""
+	if b.proxyAuthDetach != nil {
+		// Plain cancels only — see cdpauth.AttachRemote. chromedp.Cancel here
+		// would send Browser.close and take chromedriver's browser with it.
+		b.proxyAuthDetach()
+		b.proxyAuthDetach = nil
 	}
 	b.cleanupUserDataDir()
 	b.stopDisplay()
@@ -290,7 +292,16 @@ func (b *webDriverBrowser) createSession(ctx context.Context) error {
 	}
 
 	var created struct {
-		SessionID string `json:"sessionId"`
+		SessionID    string `json:"sessionId"`
+		Capabilities struct {
+			// chromedriver publishes the browser's DevTools endpoint here. It
+			// is the only way this backend can reach CDP for anything the HTTP
+			// tunnel cannot express — namely event streams, which is what proxy
+			// auth needs.
+			ChromeOptions struct {
+				DebuggerAddress string `json:"debuggerAddress"`
+			} `json:"goog:chromeOptions"`
+		} `json:"capabilities"`
 	}
 	_ = json.Unmarshal(raw, &created)
 
@@ -303,6 +314,32 @@ func (b *webDriverBrowser) createSession(ctx context.Context) error {
 	}
 
 	b.sess.ID = sessionID
+	b.debuggerAddress = strings.TrimSpace(created.Capabilities.ChromeOptions.DebuggerAddress)
+	return nil
+}
+
+// enableProxyAuth answers proxy authentication challenges over CDP.
+//
+// Credentials used to come from a generated MV3 extension loaded with
+// --load-extension. Chrome removed that switch, so on any current build the
+// extension never loaded and every authenticated proxy answered 407 — or, worse,
+// before --proxy-server was made unconditional, the request quietly went out
+// over the real IP instead. CDP still works, and it is the same mechanism the
+// chromedp backend has always used; the only difference is that here we attach
+// to a browser chromedriver owns.
+func (b *webDriverBrowser) enableProxyAuth() error {
+	if b.proxy == nil || strings.TrimSpace(b.proxy.Username) == "" {
+		return nil
+	}
+	if b.debuggerAddress == "" {
+		return fmt.Errorf("chromedriver reported no debuggerAddress, so proxy credentials cannot be supplied")
+	}
+
+	detach, err := cdpauth.AttachRemote(b.debuggerAddress, b.proxy.Username, b.proxy.Password, b.logger)
+	if err != nil {
+		return fmt.Errorf("proxy authentication: %w", err)
+	}
+	b.proxyAuthDetach = detach
 	return nil
 }
 
@@ -340,12 +377,17 @@ func (b *webDriverBrowser) chromeArgs() []string {
 	if b.userDataDir != "" {
 		args = append(args, "--user-data-dir="+b.userDataDir)
 	}
-	if b.proxyExtDir != "" {
-		args = append(args,
-			"--disable-features=DisableLoadExtensionCommandLineSwitch",
-			"--load-extension="+b.proxyExtDir,
-		)
-	} else if b.proxy != nil && strings.TrimSpace(b.proxy.URL) != "" {
+	// Unconditional, and it is the only thing that routes traffic now.
+	// Credentials used to come from an MV3 extension passed with
+	// --load-extension, which also carried the proxy address — and this branch
+	// was its `else`. Chrome has since removed --load-extension (measured on
+	// Chrome 151: --proxy-server 17 hits against a local proxy,
+	// --load-extension 0, with or without the DisableLoadExtension...
+	// escape hatch), so that arrangement meant a proxy *with* credentials
+	// passed no proxy flag at all and every request went out over the real IP,
+	// succeeding with nothing in the response to show for it. Credentials are
+	// now supplied over CDP instead; see enableProxyAuth.
+	if b.proxy != nil && strings.TrimSpace(b.proxy.URL) != "" {
 		args = append(args, "--proxy-server="+b.proxy.URL)
 	}
 	args = append(args, splitChromeArgs(os.Getenv("CHROME_ARGS"))...)
@@ -1357,137 +1399,6 @@ func (b *webDriverBrowser) cleanupUserDataDir() {
 	}
 	_ = os.RemoveAll(b.userDataDir)
 	b.userDataDir = ""
-}
-
-func (b *webDriverBrowser) prepareProxyExtension() error {
-	if b.proxy == nil || strings.TrimSpace(b.proxy.URL) == "" || strings.TrimSpace(b.proxy.Username) == "" {
-		return nil
-	}
-
-	parsed, err := url.Parse(b.proxy.URL)
-	if err != nil {
-		return fmt.Errorf("parse proxy url: %w", err)
-	}
-	if parsed.Hostname() == "" || parsed.Port() == "" {
-		return fmt.Errorf("proxy url must include host and port")
-	}
-
-	dir, err := ensureProxyExtensionDir(parsed, b.proxy.Username, b.proxy.Password)
-	if err != nil {
-		return err
-	}
-
-	b.proxyExtDir = dir
-	b.keepProxyExtDir = true
-	return nil
-}
-
-func ensureProxyExtensionDir(parsed *url.URL, username, password string) (string, error) {
-	cacheRoot, err := proxyExtensionCacheRoot()
-	if err != nil {
-		return "", err
-	}
-
-	key := proxyExtensionCacheKey(parsed, username, password)
-	dir := filepath.Join(cacheRoot, key)
-	manifestPath := filepath.Join(dir, "manifest.json")
-	backgroundPath := filepath.Join(dir, "background.js")
-	if fileExists(manifestPath) && fileExists(backgroundPath) {
-		return dir, nil
-	}
-
-	proxyExtensionCacheMu.Lock()
-	defer proxyExtensionCacheMu.Unlock()
-
-	if fileExists(manifestPath) && fileExists(backgroundPath) {
-		return dir, nil
-	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", fmt.Errorf("create proxy extension cache dir: %w", err)
-	}
-
-	manifest := `{
-  "version": "1.0.0",
-  "manifest_version": 3,
-  "name": "Chrome Proxy",
-  "permissions": ["proxy", "tabs", "storage", "webRequest", "webRequestAuthProvider"],
-  "host_permissions": ["<all_urls>"],
-  "background": { "service_worker": "background.js" },
-  "minimum_chrome_version": "76.0.0"
-}`
-
-	background := fmt.Sprintf(`var config = {
-  mode: "fixed_servers",
-  rules: {
-    singleProxy: {
-      scheme: %q,
-      host: %q,
-      port: %s
-    },
-    bypassList: ["localhost"]
-  }
-};
-
-chrome.proxy.settings.set({value: config, scope: "regular"}, function() {});
-
-function callbackFn(details) {
-  return {
-    authCredentials: {
-      username: %q,
-      password: %q
-    }
-  };
-}
-
-chrome.webRequest.onAuthRequired.addListener(
-  callbackFn,
-  { urls: ["<all_urls>"] },
-  ["blocking"]
-);`, parsed.Scheme, parsed.Hostname(), parsed.Port(), username, password)
-
-	if err := writeProxyExtensionFile(manifestPath, []byte(manifest)); err != nil {
-		return "", err
-	}
-	if err := writeProxyExtensionFile(backgroundPath, []byte(background)); err != nil {
-		return "", err
-	}
-	return dir, nil
-}
-
-func proxyExtensionCacheRoot() (string, error) {
-	baseDir, err := os.UserCacheDir()
-	if err != nil || strings.TrimSpace(baseDir) == "" {
-		baseDir = os.TempDir()
-	}
-	dir := filepath.Join(baseDir, "flaresolverr-go", "proxy-extension")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", fmt.Errorf("create proxy extension cache root: %w", err)
-	}
-	return dir, nil
-}
-
-func proxyExtensionCacheKey(parsed *url.URL, username, password string) string {
-	sum := sha256.Sum256([]byte(strings.Join([]string{
-		strings.TrimSpace(parsed.Scheme),
-		strings.TrimSpace(parsed.Hostname()),
-		strings.TrimSpace(parsed.Port()),
-		strings.TrimSpace(username),
-		password,
-	}, "|")))
-	return hex.EncodeToString(sum[:])
-}
-
-func writeProxyExtensionFile(path string, content []byte) error {
-	tempPath := path + ".tmp"
-	if err := os.WriteFile(tempPath, content, 0o644); err != nil {
-		_ = os.Remove(tempPath)
-		return err
-	}
-	if err := os.Rename(tempPath, path); err != nil {
-		_ = os.Remove(tempPath)
-		return err
-	}
-	return nil
 }
 
 func splitChromeArgs(raw string) []string {

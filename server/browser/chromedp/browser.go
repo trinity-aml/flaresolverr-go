@@ -13,9 +13,9 @@ import (
 	"time"
 
 	browserpkg "github.com/trinity-aml/flaresolverr-go/server/browser"
+	"github.com/trinity-aml/flaresolverr-go/server/browser/cdpauth"
 
 	"github.com/chromedp/cdproto/emulation"
-	"github.com/chromedp/cdproto/fetch"
 	"github.com/chromedp/cdproto/input"
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/cdproto/page"
@@ -386,36 +386,10 @@ func (b *chromedpBrowser) enableProxyAuth() error {
 	if b.proxy == nil || b.proxy.Username == "" {
 		return nil
 	}
-
-	chromedp.ListenTarget(b.browserCtx, func(ev any) {
-		switch e := ev.(type) {
-		case *fetch.EventRequestPaused:
-			go func() {
-				ctx, cancel := context.WithTimeout(b.browserCtx, 5*time.Second)
-				defer cancel()
-				_ = chromedp.Run(ctx, fetch.ContinueRequest(e.RequestID))
-			}()
-		case *fetch.EventAuthRequired:
-			go func() {
-				ctx, cancel := context.WithTimeout(b.browserCtx, 5*time.Second)
-				defer cancel()
-				response := &fetch.AuthChallengeResponse{Response: fetch.AuthChallengeResponseResponseDefault}
-				if e.AuthChallenge != nil && e.AuthChallenge.Source == fetch.AuthChallengeSourceProxy {
-					response = &fetch.AuthChallengeResponse{
-						Response: fetch.AuthChallengeResponseResponseProvideCredentials,
-						Username: b.proxy.Username,
-						Password: b.proxy.Password,
-					}
-				}
-				_ = chromedp.Run(ctx, fetch.ContinueWithAuth(e.RequestID, response))
-			}()
-		}
-	})
-
-	return chromedp.Run(
-		b.browserCtx,
-		fetch.Enable().WithHandleAuthRequests(true).WithPatterns([]*fetch.RequestPattern{{URLPattern: "*"}}),
-	)
+	// Shared with the chromedriver backend, which reaches a browser it does not
+	// own through cdpauth.AttachRemote. This handler used to live here as a
+	// private copy — the kind that drifts.
+	return cdpauth.Install(b.browserCtx, b.proxy.Username, b.proxy.Password, b.logger)
 }
 
 func (b *chromedpBrowser) trackDocumentResponses() {
