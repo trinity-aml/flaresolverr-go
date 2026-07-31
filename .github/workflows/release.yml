@@ -1,0 +1,160 @@
+name: Release
+
+# Two ways in, one path through:
+#   - pushing a v* tag releases it automatically;
+#   - running the workflow by hand releases a tag that already exists.
+#
+# This workflow never creates a tag. Releasing is the act of publishing what a
+# tag already points at, so the tag is the input, not a side effect — which also
+# makes a manual re-run safe.
+on:
+  push:
+    # This repo tags without a v prefix (1.0.7); the prefixed form is accepted
+    # too so switching convention later does not silently stop releasing.
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+*'
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to release, e.g. 1.0.8'
+        required: true
+        type: string
+      draft:
+        description: 'Publish as a draft (review before it goes live)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Never let two runs publish the same tag at once.
+concurrency:
+  group: release-${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      prerelease: ${{ steps.tag.outputs.prerelease }}
+    steps:
+      # fetch-depth: 0 — the default shallow clone carries no tags, so the
+      # existence check below would reject every tag.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Inputs reach the shell through the environment, never by expression
+      # substitution into the script: a tag name is attacker-influenced text,
+      # and `${{ }}` inside run: pastes it in as code.
+      - id: tag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "${EVENT_NAME}" = "push" ]; then
+            tag="${GITHUB_REF#refs/tags/}"
+          else
+            tag="${INPUT_TAG}"
+          fi
+
+          if ! git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "::error::tag '${tag}' does not exist; create and push it first"
+            exit 1
+          fi
+
+          # Semver spells a pre-release with a hyphen: 1.0.8-rc1.
+          prerelease=false
+          case "${tag}" in *-*) prerelease=true ;; esac
+
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
+          echo "releasing ${tag} (prerelease=${prerelease})"
+
+  verify:
+    name: Verify
+    needs: resolve
+    # The same checks CI runs on a PR, against the tagged tree rather than
+    # whichever branch this run was started from.
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.resolve.outputs.tag }}
+
+  release:
+    name: Build and publish
+    needs: [resolve, verify]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # build_all.sh owns the target list and the ldflags; duplicating either
+      # here is how a release starts differing from a local build.
+      #
+      # VERSION is passed explicitly rather than left to the script's
+      # `git describe` fallback: that would depend on the checkout carrying
+      # tags, and would quietly stamp a bare commit hash if it did not.
+      #
+      # GOCACHE/GOMODCACHE are pointed back at the toolchain defaults so
+      # setup-go's cache is used; the script otherwise puts them in-tree.
+      - name: Cross-compile all targets
+        env:
+          VERSION: ${{ needs.resolve.outputs.tag }}
+        run: |
+          export GOCACHE="$(go env GOCACHE)"
+          export GOMODCACHE="$(go env GOMODCACHE)"
+          ./build_all.sh
+
+      # Catches the failure this step exists for: a build that succeeded but
+      # stamped the wrong string, which otherwise only shows up as a wrong
+      # version in GET / long after the release is public.
+      - name: Check the version was stamped
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! grep -aq -- "${TAG}" ./Dist/flaresolverr-linux-amd64; then
+            echo "::error::binaries do not carry '${TAG}'; the -X ldflag did not take"
+            exit 1
+          fi
+          echo "version ${TAG} present in the built binaries"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
+          DRAFT: ${{ github.event_name == 'workflow_dispatch' && inputs.draft }}
+        run: |
+          set -euo pipefail
+
+          flags=()
+          [ "${PRERELEASE}" = "true" ] && flags+=(--prerelease)
+          [ "${DRAFT}" = "true" ] && flags+=(--draft)
+
+          # Re-running after a partial failure has to converge rather than
+          # abort, so an existing release gets its assets replaced instead.
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "release ${TAG} already exists; replacing its assets"
+            gh release upload "${TAG}" ./Dist/* --clobber
+          else
+            gh release create "${TAG}" ./Dist/* \
+              --title "${TAG}" \
+              --generate-notes \
+              "${flags[@]}"
+          fi
+
+          gh release view "${TAG}" --json url --jq .url

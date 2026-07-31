@@ -4,6 +4,14 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Callable so the release workflow gates on exactly these checks instead of
+  # keeping a second copy of them that can drift.
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit-ish to check out. Defaults to the triggering ref.
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -13,6 +21,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
 
       - uses: actions/setup-go@v5
         with:
@@ -62,6 +72,8 @@ jobs:
           - { goos: freebsd, goarch: arm64 }
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
 
       - uses: actions/setup-go@v5
         with:
