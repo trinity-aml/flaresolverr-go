@@ -473,8 +473,23 @@ func (b *geckoBrowser) solveChallenge(ctx context.Context) error {
 	const (
 		maxAttempts = 30
 		tick        = time.Second
+
+		// An interactive Turnstile ("verify you are human") never clears on
+		// its own — it needs a real click on the checkbox. This loop used to
+		// only wait and wiggle the mouse, so such a challenge always ran out
+		// the attempts and failed, even though clickTurnstileCheckbox already
+		// existed: it was only reachable from ApplyTurnstileToken, which runs
+		// *after* solveChallenge has succeeded.
+		//
+		// Give the passive path a few seconds first: a Managed Challenge often
+		// clears by itself, and clicking before the widget script has wired up
+		// its handler does nothing.
+		firstClickAttempt = 3
+		clickEvery        = 6
 	)
-	for attempt := 0; attempt < maxAttempts; attempt++ {
+
+	clickAttempts := 0
+	for attempt := range maxAttempts {
 		if err := sleepContext(ctx, tick); err != nil {
 			return err
 		}
@@ -483,13 +498,59 @@ func (b *geckoBrowser) solveChallenge(ctx context.Context) error {
 			return err
 		}
 		if !found {
+			b.awaitDocumentReady(ctx)
 			return nil
 		}
+
+		if attempt >= firstClickAttempt && (attempt-firstClickAttempt)%clickEvery == 0 {
+			clickAttempts++
+			clicked, diag := b.clickTurnstileCheckbox(ctx)
+			b.logger.Debug("turnstile checkbox click during solve",
+				"attempt", attempt, "clicked", clicked, "diag", diag)
+		}
+
 		if attempt%5 == 4 {
 			_ = b.mouseWiggle(ctx)
 		}
 	}
-	return fmt.Errorf("cloudflare challenge did not clear within %d seconds", maxAttempts)
+	return fmt.Errorf("cloudflare challenge did not clear within %d seconds (%d checkbox click attempts)", maxAttempts, clickAttempts)
+}
+
+// awaitDocumentReady waits for the destination page to finish parsing before
+// the pipeline snapshots it.
+//
+// Clearing a challenge ends in a navigation to the real page, and the challenge
+// stops being detectable the moment that navigation starts — so without this
+// the snapshot can catch a document that has only got as far as </head>.
+// Measured on a live interactive challenge: the response was 1.4 KB with no
+// <body> at waitInSeconds=0 and the full 12 KB page at waitInSeconds=2. Waiting
+// on the page's own state beats making callers guess a sleep.
+//
+// Every exit is a plain return: this only improves what the caller is about to
+// read, so a driver that will not answer is a reason to stop waiting, never a
+// reason to fail a solve that already succeeded.
+func (b *geckoBrowser) awaitDocumentReady(ctx context.Context) {
+	const (
+		budget = 10 * time.Second
+		poll   = 200 * time.Millisecond
+	)
+
+	deadline := time.Now().Add(budget)
+	for time.Now().Before(deadline) {
+		// document.body is checked alongside readyState because a document that
+		// has not started loading yet still reports the previous "complete".
+		ready, err := b.sess.ExecuteBool(ctx, `document.readyState === 'complete' && !!document.body`)
+		if err != nil {
+			return
+		}
+		if ready {
+			return
+		}
+		if err := sleepContext(ctx, poll); err != nil {
+			return
+		}
+	}
+	b.logger.Debug("page still loading when the challenge cleared", "waited", budget)
 }
 
 // mouseWiggle sends a short sequence of mouse moves via the W3C Actions API.
@@ -571,99 +632,125 @@ func (b *geckoBrowser) userAgent(ctx context.Context) (string, error) {
 	return b.cachedUserAgent, nil
 }
 
-// clickTurnstileCheckbox sends a real pointer click at the screen-space
-// center of the Turnstile widget. Cloudflare hosts the actual checkbox
-// inside a cross-origin iframe (challenges.cloudflare.com), so we can't
-// dispatch synthetic events at it from page JS — but Firefox forwards a
-// WebDriver Actions pointer click at the right (x, y) coordinates into
-// the iframe just fine. Returns true if a widget was found and clicked.
+// challengeFrameSelector matches the cross-origin iframe Cloudflare serves the
+// Turnstile widget from.
+const challengeFrameSelector = `iframe[src*="challenges.cloudflare.com"]`
+
+const (
+	// Each candidate node costs one round-trip to the driver, so the shadow
+	// walk is bounded. A challenge interstitial is a few dozen elements; the
+	// cap only bites if we somehow run it against a full-size page.
+	shadowWalkMaxNodes = 400
+	shadowWalkMaxDepth = 6
+)
+
+// clickTurnstileCheckbox locates the "verify you are human" checkbox and clicks
+// it natively. Returns whether the click was accepted, plus a diagnostic string.
+//
+// The path to that checkbox crosses two closed shadow roots — one hiding the
+// challenges.cloudflare.com iframe in the host page, one hiding the checkbox
+// inside that iframe's body — so none of it is visible to page JavaScript. An
+// earlier version of this function ran document.querySelector from the page and
+// consequently reported "no widget" on every single attempt: not a click that
+// missed, a widget that could not be seen. The WebDriver element endpoints do
+// see it, because Firefox hands over closed shadow roots (see w3c.ShadowRoot).
 func (b *geckoBrowser) clickTurnstileCheckbox(ctx context.Context) (bool, string) {
-	// First locate the widget. We try several candidate selectors and
-	// scroll the chosen element into view before clicking, otherwise the
-	// pointer click lands on background pixels and Cloudflare never sees
-	// the gesture.
-	const locate = `
-        (function() {
-            var selectors = [
-                'iframe[src*="challenges.cloudflare.com"]',
-                '.cf-turnstile iframe',
-                '.cf-turnstile',
-                '[data-sitekey]'
-            ];
-            var found = null;
-            for (var i = 0; i < selectors.length; i++) {
-                var el = document.querySelector(selectors[i]);
-                if (el) {
-                    var r0 = el.getBoundingClientRect();
-                    if (r0.width >= 4 && r0.height >= 4) {
-                        found = {el: el, sel: selectors[i]};
-                        break;
-                    }
-                }
-            }
-            if (!found) {
-                // Count widgets to help diagnose
-                var cnt = document.querySelectorAll('.cf-turnstile, [data-sitekey], iframe').length;
-                return {error: 'no-widget', iframe_total: cnt};
-            }
-            try {
-                found.el.scrollIntoView({block: 'center', inline: 'center'});
-            } catch (_) {}
-            var r = found.el.getBoundingClientRect();
-            var cx = Math.round(r.left + Math.min(30, r.width / 2));
-            var cy = Math.round(r.top + r.height / 2);
-            return {selector: found.sel, x: cx, y: cy, w: Math.round(r.width), h: Math.round(r.height),
-                    viewportW: window.innerWidth, viewportH: window.innerHeight};
-        })()
-    `
-	raw, err := b.sess.Execute(ctx, locate)
+	frame, walked, err := b.findThroughShadowDOM(ctx, challengeFrameSelector)
 	if err != nil {
-		return false, fmt.Sprintf("locate js err: %v", err)
+		return false, fmt.Sprintf("locating the challenge frame failed after %d nodes: %v", walked, err)
 	}
-	var pos struct {
-		Selector    string `json:"selector"`
-		Error       string `json:"error"`
-		IframeTotal int    `json:"iframe_total"`
-		X           int    `json:"x"`
-		Y           int    `json:"y"`
-		W           int    `json:"w"`
-		H           int    `json:"h"`
-		ViewportW   int    `json:"viewportW"`
-		ViewportH   int    `json:"viewportH"`
+	if frame == "" {
+		return false, fmt.Sprintf("no challenge frame on the page (%d nodes walked)", walked)
 	}
-	if err := json.Unmarshal(raw, &pos); err != nil {
-		return false, fmt.Sprintf("locate json err: %v raw=%s", err, string(raw))
-	}
-	if pos.Error != "" || (pos.W == 0 && pos.H == 0) {
-		return false, fmt.Sprintf("widget not located: err=%q iframe_total=%d", pos.Error, pos.IframeTotal)
-	}
-	diag := fmt.Sprintf("sel=%s x=%d y=%d w=%d h=%d viewport=%dx%d", pos.Selector, pos.X, pos.Y, pos.W, pos.H, pos.ViewportW, pos.ViewportH)
 
-	// Brief settle after scroll before the click.
-	_ = sleepContext(ctx, 300*time.Millisecond)
+	if err := b.sess.SwitchToFrame(ctx, frame); err != nil {
+		return false, "switch into the challenge frame: " + err.Error()
+	}
+	// Everything below addresses the iframe, including any later call on this
+	// session — the pipeline reads Title and HTML right after us.
+	defer func() {
+		if err := b.sess.SwitchToDefaultContent(ctx); err != nil {
+			b.logger.Warn("could not return to the top-level browsing context", "err", err)
+		}
+	}()
 
-	actions := []map[string]any{
-		{
-			"id":         "turnstile-mouse",
-			"type":       "pointer",
-			"parameters": map[string]any{"pointerType": "mouse"},
-			"actions": []map[string]any{
-				{"type": "pointerMove", "duration": 150, "x": pos.X, "y": pos.Y, "origin": "viewport"},
-				{"type": "pause", "duration": 200},
-				{"type": "pointerDown", "button": 0},
-				{"type": "pause", "duration": 120},
-				{"type": "pointerUp", "button": 0},
-			},
-		},
+	checkbox, walked, err := b.findThroughShadowDOM(ctx, "input[type=checkbox]")
+	if err != nil {
+		return false, fmt.Sprintf("locating the checkbox failed after %d nodes: %v", walked, err)
 	}
-	if _, _, err := b.sess.Do(ctx, http.MethodPost, b.sess.Path("/actions"), map[string]any{
-		"actions": actions,
-	}); err != nil {
-		_, _, _ = b.sess.Do(ctx, http.MethodDelete, b.sess.Path("/actions"), nil)
-		return false, diag + " click-actions err: " + err.Error()
+	if checkbox == "" {
+		// A passive challenge has no checkbox at all; that is not a failure.
+		return false, fmt.Sprintf("challenge frame has no checkbox (%d nodes walked)", walked)
 	}
-	_, _, _ = b.sess.Do(ctx, http.MethodDelete, b.sess.Path("/actions"), nil)
-	return true, diag
+
+	if err := b.sess.ClickElement(ctx, checkbox); err != nil {
+		return false, "click the checkbox: " + err.Error()
+	}
+
+	// Only report success once the widget agrees the click landed. Cloudflare
+	// swaps the widget out on acceptance, so a stale reference is a pass, not a
+	// failure.
+	_ = sleepContext(ctx, 500*time.Millisecond)
+	selected, err := b.sess.ElementSelected(ctx, checkbox)
+	if err != nil {
+		return true, "clicked, widget replaced (" + err.Error() + ")"
+	}
+	return selected, fmt.Sprintf("clicked, checked=%t", selected)
+}
+
+// findThroughShadowDOM returns a reference to the first element matching
+// selector in the current browsing context, descending into shadow roots when
+// the light DOM has no match. It also reports how many nodes it probed, which
+// is the number that tells "found nothing" apart from "gave up".
+//
+// The walk is breadth-first and deliberately unfiltered: a closed shadow host
+// is indistinguishable from an ordinary element until the driver is asked, so
+// every node is a candidate and the cost is capped instead of guessed at.
+func (b *geckoBrowser) findThroughShadowDOM(ctx context.Context, selector string) (string, int, error) {
+	ids, err := b.sess.FindElements(ctx, selector)
+	if err != nil {
+		return "", 0, err
+	}
+	if len(ids) > 0 {
+		return ids[0], 0, nil
+	}
+
+	walked := 0
+	roots := []string{""} // "" is the document itself
+	for depth := 0; depth < shadowWalkMaxDepth && len(roots) > 0; depth++ {
+		var deeper []string
+		for _, root := range roots {
+			hosts, err := b.findAllIn(ctx, root, "*")
+			if err != nil {
+				continue
+			}
+			for _, host := range hosts {
+				if walked >= shadowWalkMaxNodes {
+					return "", walked, fmt.Errorf("shadow walk hit its %d-node cap", shadowWalkMaxNodes)
+				}
+				walked++
+
+				shadow, err := b.sess.ShadowRoot(ctx, host)
+				if err != nil || shadow == "" {
+					continue
+				}
+				if found, err := b.sess.FindElementsInShadow(ctx, shadow, selector); err == nil && len(found) > 0 {
+					return found[0], walked, nil
+				}
+				deeper = append(deeper, shadow)
+			}
+		}
+		roots = deeper
+	}
+	return "", walked, nil
+}
+
+// findAllIn searches a shadow root, or the document when root is "".
+func (b *geckoBrowser) findAllIn(ctx context.Context, root, selector string) ([]string, error) {
+	if root == "" {
+		return b.sess.FindElements(ctx, selector)
+	}
+	return b.sess.FindElementsInShadow(ctx, root, selector)
 }
 
 // readTurnstileToken returns the value of any cf-turnstile-response input on

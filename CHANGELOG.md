@@ -84,6 +84,41 @@
   `session_ttl_minutes`, `tabs_till_verify`, раздел про тесты.
 - `browser_backend` добавлен в поставляемый `init.yaml`.
 
+### Исправлено (интерактивный Turnstile на geckodriver)
+
+- **Бэкенд geckodriver не мог решить ни один интерактивный челлендж** («подтвердите, что вы человек»).
+  Причин было две, и обе устранены:
+  - `solveChallenge` только ждал и двигал мышью, а `clickTurnstileCheckbox` вызывался лишь из
+    `ApplyTurnstileToken` — то есть **после** успешного solve. Интерактивный челлендж сам не
+    исчезает, поэтому цикл всегда вырабатывал все попытки и падал по таймауту. Клик перенесён внутрь
+    цикла.
+  - Сам поиск виджета шёл через `document.querySelector` в странице и всегда возвращал
+    `no-widget, iframe_total=0`. Cloudflare рендерит Turnstile в **закрытом** shadow root: для
+    страничного JS `el.shadowRoot === null`, а iframe внутри shadow-дерева не попадает даже в
+    `window.frames` (спека исключает его из document-tree child browsing contexts). У Firefox нет
+    аналога chromium-флага `--enable-blink-features=FakeShadowRoot`, которым пользуются два других
+    бэкенда.
+
+  Решение: не искать виджет силами страницы. Marionette отдаёт закрытые shadow root через сам
+  протокол (`GET /session/:id/element/:id/shadow`), поэтому путь до чекбокса проходится ссылками на
+  элементы: обход shadow-деревьев → `SwitchToFrame` в iframe `challenges.cloudflare.com` → второй
+  обход внутри него → нативный `POST /element/:id/click`. Успех подтверждается через
+  `GET /element/:id/selected`, а не фактом отправки клика.
+
+- **Успешно решённый челлендж возвращал страницу без `<body>`.** Челлендж перестаёт детектироваться
+  в момент, когда начинается переход на настоящую страницу, и пайплайн снимал HTML раньше, чем та
+  успевала распарситься. На живом челлендже: 1439 байт, обрыв на `</head>`, при `waitInSeconds=0` —
+  и полные 12 КБ при `waitInSeconds=2`. Теперь `solveChallenge` дожидается
+  `document.readyState === 'complete' && !!document.body` (бюджет 10 с) вместо того, чтобы вынуждать
+  вызывающего угадывать паузу. Само по себе свойство пайплайна не новое — просто до сих пор
+  geckodriver не доходил до этой точки на интерактивных челленджах.
+
+- В `w3c` добавлены element-примитивы (`FindElements`, `FindElementsInShadow`, `ShadowRoot`,
+  `ClickElement`, `ElementSelected`, `SwitchToFrame`, `SwitchToDefaultContent`) и типизированная
+  `DriverError` с кодом ошибки W3C. Последнее было обязательным: Firefox отвечает на
+  `no such shadow root` с **пустым** `message`, и прежний код терял такой ответ в безымянной
+  `http 404`, из-за чего обход не мог отличить «здесь нет shadow root» от сбоя драйвера.
+
 ### Исправлено (рефакторинг бэкендов)
 
 - **chromedp-бэкенд оставлял каталог профиля после каждого запроса.** `Close()` вызывал

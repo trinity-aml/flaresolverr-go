@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -35,6 +36,23 @@ type Session struct {
 	// ErrPrefix labels protocol-level errors so a message names the driver that
 	// produced it ("webdriver" / "geckodriver").
 	ErrPrefix string
+}
+
+// DriverError is an error reply from the driver. Error() returns the driver's
+// own message unchanged; Code carries the W3C error code alongside it so a
+// caller can tell an expected outcome ("no such element" for a selector that
+// matched nothing) from a genuine failure.
+type DriverError struct {
+	Code    string
+	Message string
+}
+
+func (e *DriverError) Error() string { return e.Message }
+
+// HasCode reports whether err is a DriverError carrying the given W3C code.
+func HasCode(err error, code string) bool {
+	var driverErr *DriverError
+	return errors.As(err, &driverErr) && driverErr.Code == code
 }
 
 // Do issues a WebDriver command and unwraps the {"value": ...} envelope.
@@ -83,8 +101,19 @@ func (s *Session) Do(ctx context.Context, method, path string, payload any) (jso
 			Error   string `json:"error"`
 			Message string `json:"message"`
 		}
-		if len(envelope.Value) > 0 && json.Unmarshal(envelope.Value, &wdErr) == nil && strings.TrimSpace(wdErr.Message) != "" {
-			return nil, envelope.SessionID, fmt.Errorf("%s", wdErr.Message)
+		if len(envelope.Value) > 0 && json.Unmarshal(envelope.Value, &wdErr) == nil {
+			code := strings.TrimSpace(wdErr.Error)
+			switch {
+			case strings.TrimSpace(wdErr.Message) != "":
+				return nil, envelope.SessionID, &DriverError{Code: code, Message: wdErr.Message}
+			case code != "":
+				// Firefox answers "no such shadow root" with an empty message,
+				// so the code alone has to carry the reply.
+				return nil, envelope.SessionID, &DriverError{
+					Code:    code,
+					Message: fmt.Sprintf("%s http %d: %s", s.ErrPrefix, resp.StatusCode, code),
+				}
+			}
 		}
 		return nil, envelope.SessionID, fmt.Errorf("%s http %d", s.ErrPrefix, resp.StatusCode)
 	}
