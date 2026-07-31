@@ -6,12 +6,9 @@
 package geckodriverbackend
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -20,10 +17,10 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	browserpkg "github.com/trinity-aml/flaresolverr-go/server/browser"
+	"github.com/trinity-aml/flaresolverr-go/server/browser/w3c"
 )
 
 type Config = browserpkg.Config
@@ -34,6 +31,7 @@ type Logger = browserpkg.Logger
 type Request = browserpkg.Request
 type Result = browserpkg.Result
 type Client = browserpkg.Client
+type documentResponse = browserpkg.DocumentResponse
 
 var (
 	appendWithEnv         = browserpkg.AppendWithEnv
@@ -54,16 +52,13 @@ type geckoBrowser struct {
 	logger Logger
 	proxy  *Proxy
 
-	httpClient        *http.Client
-	baseURL           string
-	sessionID         string
+	sess              *w3c.Session
 	effectiveHeadless bool
 
-	driverCmd        *exec.Cmd
+	driver           *w3c.DriverProcess
 	driverRuntimeDir string
-	driverLogPath    string
-	driverLogFile    *os.File
 	cachedUserAgent  string
+	mediaBlockWarned bool
 
 	xvfbProc        *browserpkg.XvfbProcess
 	previousDisplay string
@@ -76,14 +71,15 @@ type geckoBrowser struct {
 
 // NewGeckoDriver starts a geckodriver process bound to the configured Firefox
 // / Camoufox binary and returns a ready-to-use Client.
-func NewGeckoDriver(cfg Config, proxy *Proxy) (Client, error) {
+func NewGeckoDriver(ctx context.Context, cfg Config, proxy *Proxy) (Client, error) {
 	b := &geckoBrowser{
 		cfg:             cfg,
 		logger:          cfg.Logger,
 		proxy:           proxy,
 		previousDisplay: os.Getenv("DISPLAY"),
-		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
+		sess: &w3c.Session{
+			HTTP:      &http.Client{Timeout: 30 * time.Second},
+			ErrPrefix: "geckodriver",
 		},
 	}
 
@@ -97,11 +93,11 @@ func NewGeckoDriver(cfg Config, proxy *Proxy) (Client, error) {
 	if err := b.prepareProfileDir(); err != nil {
 		return nil, err
 	}
-	if err := b.startDriver(); err != nil {
+	if err := b.startDriver(ctx); err != nil {
 		_ = b.Close()
 		return nil, err
 	}
-	if err := b.createSession(); err != nil {
+	if err := b.createSession(ctx); err != nil {
 		_ = b.Close()
 		return nil, err
 	}
@@ -140,13 +136,9 @@ func (b *geckoBrowser) Close() error {
 
 	// DELETE /session tells geckodriver to quit Firefox gracefully.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	b.deleteSession(ctx)
+	b.sess.Delete(ctx)
 	cancel()
-	b.stopDriver()
-	if b.driverLogFile != nil {
-		_ = b.driverLogFile.Close()
-		b.driverLogFile = nil
-	}
+	b.driver.Stop()
 	if b.driverRuntimeDir != "" {
 		_ = os.RemoveAll(b.driverRuntimeDir)
 		b.driverRuntimeDir = ""
@@ -156,46 +148,15 @@ func (b *geckoBrowser) Close() error {
 	return nil
 }
 
-// stopDriver waits for geckodriver to exit on its own (triggered by DELETE
-// /session) for a short grace period, then escalates to SIGTERM and finally
-// SIGKILL. Killing immediately orphans the Firefox child and strands the
-// profile directory on disk.
-func (b *geckoBrowser) stopDriver() {
-	if b.driverCmd == nil || b.driverCmd.Process == nil {
-		return
-	}
-	done := make(chan error, 1)
-	go func() { done <- b.driverCmd.Wait() }()
-
-	select {
-	case <-done:
-		b.driverCmd = nil
-		return
-	case <-time.After(3 * time.Second):
-	}
-
-	_ = b.driverCmd.Process.Signal(syscall.SIGTERM)
-	select {
-	case <-done:
-		b.driverCmd = nil
-		return
-	case <-time.After(2 * time.Second):
-	}
-
-	_ = b.driverCmd.Process.Kill()
-	<-done
-	b.driverCmd = nil
-}
-
 // ---------- driver lifecycle ----------
 
-func (b *geckoBrowser) startDriver() error {
-	port, err := freeLocalPort()
+func (b *geckoBrowser) startDriver(ctx context.Context) error {
+	port, err := w3c.FreeLocalPort()
 	if err != nil {
 		return fmt.Errorf("reserve geckodriver port: %w", err)
 	}
 
-	effectiveHeadless, display, err := b.prepareHeadlessMode()
+	effectiveHeadless, display, err := b.prepareHeadlessMode(ctx)
 	if err != nil {
 		return err
 	}
@@ -206,55 +167,34 @@ func (b *geckoBrowser) startDriver() error {
 		env = appendWithEnv(env, "DISPLAY", display)
 	}
 
-	cmdArgs := []string{
-		"--host", "127.0.0.1",
-		"--port", fmt.Sprintf("%d", port),
-		"--binary", b.cfg.BrowserPath,
+	spec := w3c.DriverSpec{
+		Name: "geckodriver",
+		Path: b.cfg.DriverPath,
+		Args: []string{
+			"--host", "127.0.0.1",
+			"--port", fmt.Sprintf("%d", port),
+			"--binary", b.cfg.BrowserPath,
+		},
+		Env: env,
 	}
-	b.driverLogPath = ""
 	if b.cfg.DebugLogging {
 		if err := b.prepareDriverRuntimeDir(); err != nil {
 			return err
 		}
-		b.driverLogPath = filepath.Join(b.driverRuntimeDir, "geckodriver.log")
-		cmdArgs = append(cmdArgs, "--log", "trace")
+		// geckodriver only logs to stdout/stderr, so it needs redirection.
+		spec.LogPath = filepath.Join(b.driverRuntimeDir, "geckodriver.log")
+		spec.RedirectOutput = true
+		spec.Args = append(spec.Args, "--log", "trace")
 	}
 
-	cmd := exec.Command(b.cfg.DriverPath, cmdArgs...)
-	cmd.Env = env
-	if b.driverLogPath != "" {
-		logFile, err := os.Create(b.driverLogPath)
-		if err != nil {
-			return fmt.Errorf("create geckodriver log: %w", err)
-		}
-		cmd.Stdout = logFile
-		cmd.Stderr = logFile
-		// Kept on the struct so Close can release it. Without this the fd is
-		// leaked for every browser instance whenever debug logging is on.
-		b.driverLogFile = logFile
-	}
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start geckodriver: %w", err)
-	}
+	b.sess.BaseURL = fmt.Sprintf("http://127.0.0.1:%d", port)
 
-	b.driverCmd = cmd
-	b.baseURL = fmt.Sprintf("http://127.0.0.1:%d", port)
-
-	deadline := time.Now().Add(15 * time.Second)
-	waitFor := 50 * time.Millisecond
-	for time.Now().Before(deadline) {
-		statusCtx, cancel := context.WithTimeout(context.Background(), time.Second)
-		_, _, err := b.webDriverRequest(statusCtx, http.MethodGet, "/status", nil)
-		cancel()
-		if err == nil {
-			return nil
-		}
-		time.Sleep(waitFor)
-		if waitFor < 500*time.Millisecond {
-			waitFor *= 2
-		}
+	driver, err := w3c.StartDriver(ctx, spec, b.sess)
+	if err != nil {
+		return err
 	}
-	return fmt.Errorf("geckodriver did not become ready")
+	b.driver = driver
+	return nil
 }
 
 func (b *geckoBrowser) prepareDriverRuntimeDir() error {
@@ -269,7 +209,7 @@ func (b *geckoBrowser) prepareDriverRuntimeDir() error {
 	return nil
 }
 
-func (b *geckoBrowser) createSession() error {
+func (b *geckoBrowser) createSession(ctx context.Context) error {
 	args := b.firefoxArgs()
 	b.logger.Debug("creating geckodriver session",
 		"browser_path", b.cfg.BrowserPath,
@@ -321,9 +261,9 @@ func (b *geckoBrowser) createSession() error {
 		},
 	}
 
-	raw, topSessionID, err := b.webDriverRequest(context.Background(), http.MethodPost, "/session", payload)
+	raw, topSessionID, err := b.sess.Do(context.Background(), http.MethodPost, "/session", payload)
 	if err != nil {
-		if tail := b.driverLogTail(); tail != "" {
+		if tail := b.driver.LogTail(); tail != "" {
 			return fmt.Errorf("create geckodriver session: %w | geckodriver log: %s", err, tail)
 		}
 		return fmt.Errorf("create geckodriver session: %w", err)
@@ -341,7 +281,7 @@ func (b *geckoBrowser) createSession() error {
 	if sessionID == "" {
 		return fmt.Errorf("geckodriver session id missing")
 	}
-	b.sessionID = sessionID
+	b.sess.ID = sessionID
 	return nil
 }
 
@@ -412,131 +352,105 @@ func (b *geckoBrowser) firefoxPrefs() map[string]any {
 // ---------- resolve flow ----------
 
 func (b *geckoBrowser) resolve(ctx context.Context, req Request) (*ChallengeResolutionResult, string, error) {
-	if err := b.navigate(ctx, req); err != nil {
-		return nil, "", fmt.Errorf("navigate: %w", err)
-	}
+	return browserpkg.ResolvePage(ctx, b, req)
+}
 
-	if len(req.Cookies) > 0 {
-		if err := b.setCookies(ctx, req.URL, req.Cookies); err != nil {
-			return nil, "", fmt.Errorf("set cookies: %w", err)
-		}
-		if err := b.navigate(ctx, req); err != nil {
-			return nil, "", fmt.Errorf("reload after cookies: %w", err)
-		}
-	}
+// ---------- browser.Page ----------
 
-	title, err := b.pageTitle(ctx)
-	if err != nil {
-		return nil, "", fmt.Errorf("read page title: %w", err)
+// SetMediaBlocked is a no-op here. Firefox has no per-request equivalent of
+// Network.setBlockedURLs; media blocking is applied once via firefoxPrefs()
+// when the profile is created, so cfg.DisableMedia works but the per-request
+// flag cannot. Reported once so the difference is visible rather than silent.
+func (b *geckoBrowser) SetMediaBlocked(_ context.Context, blocked bool) error {
+	if blocked && !b.cfg.DisableMedia && !b.mediaBlockWarned {
+		b.mediaBlockWarned = true
+		b.logger.Warn("per-request disableMedia is not supported by the geckodriver backend; set disable_media in the config to block media for the whole profile")
 	}
-	for _, accessTitle := range accessDeniedTitles {
-		if strings.HasPrefix(title, accessTitle) {
-			return nil, "", fmt.Errorf("Cloudflare has blocked this request. Probably your IP is banned for this site, check in your web browser.")
-		}
-	}
-	for _, selector := range accessDeniedSelectors {
-		exists, err := b.selectorExists(ctx, selector)
-		if err != nil {
-			return nil, "", fmt.Errorf("check access denied selector %q: %w", selector, err)
-		}
-		if exists {
-			return nil, "", fmt.Errorf("Cloudflare has blocked this request. Probably your IP is banned for this site, check in your web browser.")
-		}
-	}
+	return nil
+}
 
-	message := "Challenge not detected!"
-	challengeFound, err := b.challengePresent(ctx)
-	if err != nil {
-		return nil, "", fmt.Errorf("detect challenge: %w", err)
-	}
-	if challengeFound {
-		if err := b.solveChallenge(ctx); err != nil {
-			return nil, "", fmt.Errorf("solve challenge: %w", err)
-		}
-		message = "Challenge solved!"
-	}
+func (b *geckoBrowser) Navigate(ctx context.Context, req Request) error {
+	return b.navigate(ctx, req)
+}
 
-	// Wait BEFORE reading currentURL/cookies/HTML. For request.post the form
-	// submission is driven from a data:URL via JS — at this point the browser
-	// is still navigating from data: to the real target, and reading cookies
-	// now returns an empty jar (the WebDriver /cookie endpoint is scoped to
-	// the current page's origin, which is data: until navigation completes).
-	// Letting WaitInSeconds elapse first ensures the snapshot reflects the
-	// post-navigation state: real currentURL, fully populated cookie jar,
-	// final response HTML.
-	if req.WaitInSeconds > 0 {
-		if err := sleepContext(ctx, time.Duration(req.WaitInSeconds)*time.Second); err != nil {
-			return nil, "", fmt.Errorf("wait after challenge: %w", err)
-		}
-	}
+func (b *geckoBrowser) SetPageCookies(ctx context.Context, rawURL string, cookies []Cookie) error {
+	return b.sess.SetCookies(ctx, rawURL, cookies)
+}
 
-	currentURL, err := b.currentURL(ctx)
-	if err != nil {
-		return nil, "", fmt.Errorf("read current url: %w", err)
-	}
-	userAgent, err := b.userAgent(ctx)
-	if err != nil {
-		return nil, "", fmt.Errorf("read user agent: %w", err)
-	}
-	cookies, err := b.currentCookies(ctx)
-	if err != nil {
-		return nil, "", fmt.Errorf("read cookies: %w", err)
-	}
+func (b *geckoBrowser) Title(ctx context.Context) (string, error) { return b.sess.Title(ctx) }
 
-	result := &ChallengeResolutionResult{
-		URL:       currentURL,
-		Status:    200, // geckodriver has no cheap way to read the real HTTP status
-		Cookies:   cookies,
-		UserAgent: userAgent,
-	}
+func (b *geckoBrowser) SelectorExists(ctx context.Context, selector string) (bool, error) {
+	return b.sess.SelectorExists(ctx, selector)
+}
 
-	// Minimal Turnstile token extraction: when the page has a
-	// cf-turnstile-response input (visible or hidden) we read its value. For
-	// Managed Challenge Invisible widgets the value is populated by the
-	// challenge script on its own — no user interaction needed — so the
-	// snapshot taken after WaitInSeconds catches it. Interactive widgets
-	// (the "click to verify" checkbox) still require a real click and are
-	// not handled here; callers will see an empty TurnstileToken in that
-	// case and can react accordingly.
+func (b *geckoBrowser) HTML(ctx context.Context) (string, error) { return b.sess.HTML(ctx) }
+
+func (b *geckoBrowser) CurrentURL(ctx context.Context) (string, error) { return b.sess.URL(ctx) }
+
+func (b *geckoBrowser) PageUserAgent(ctx context.Context) (string, error) {
+	return b.userAgent(ctx)
+}
+
+func (b *geckoBrowser) PageCookies(ctx context.Context, _ string) ([]Cookie, error) {
+	return b.sess.Cookies(ctx)
+}
+
+func (b *geckoBrowser) Screenshot(ctx context.Context) (string, error) {
+	return b.sess.Screenshot(ctx)
+}
+
+func (b *geckoBrowser) ChallengePresent(ctx context.Context) (bool, error) {
+	return b.challengePresent(ctx)
+}
+
+func (b *geckoBrowser) SolveChallenge(ctx context.Context) error {
+	return b.solveChallenge(ctx)
+}
+
+// DocumentResponse returns a zero value: geckodriver exposes no cheap way to
+// read the real HTTP status, so the pipeline keeps its 200 default.
+func (b *geckoBrowser) DocumentResponse(context.Context, string) (documentResponse, error) {
+	return documentResponse{}, nil
+}
+
+// ApplyTurnstileToken keeps this backend's own two-stage strategy: Managed
+// Challenge Invisible widgets populate cf-turnstile-response by themselves, so
+// the value is read first with no interaction; only if that is empty (and the
+// caller asked via tabs_till_verify) do we click the checkbox and re-read,
+// refreshing the cookie jar because the click can mint new cookies.
+func (b *geckoBrowser) ApplyTurnstileToken(ctx context.Context, req Request, result *ChallengeResolutionResult) error {
 	if token, err := b.readTurnstileToken(ctx); err == nil && token != "" {
 		result.TurnstileToken = token
 		b.logger.Info("turnstile token captured without interaction", "len", len(token))
-	} else if req.TabsTillVerify != nil {
-		b.logger.Info("turnstile token not auto-populated, attempting interactive click")
-		clicked, diag := b.clickTurnstileCheckbox(ctx)
-		b.logger.Info("turnstile click result", "clicked", clicked, "diag", diag)
-		if clicked {
-			_ = sleepContext(ctx, 5*time.Second)
-			if token, err := b.readTurnstileToken(ctx); err == nil && token != "" {
-				result.TurnstileToken = token
-				b.logger.Info("turnstile token captured after click", "len", len(token))
-				if fresh, err := b.currentCookies(ctx); err == nil && len(fresh) > 0 {
-					result.Cookies = fresh
-				}
-			} else {
-				b.logger.Info("turnstile token still empty after click")
-			}
-		}
+		return nil
+	}
+	if req.TabsTillVerify == nil {
+		return nil
 	}
 
-	if !req.ReturnOnlyCookies {
-		htmlDoc, err := b.pageHTML(ctx)
-		if err != nil {
-			return nil, "", fmt.Errorf("read response html: %w", err)
-		}
-		result.Response = htmlDoc
+	b.logger.Info("turnstile token not auto-populated, attempting interactive click")
+	clicked, diag := b.clickTurnstileCheckbox(ctx)
+	b.logger.Info("turnstile click result", "clicked", clicked, "diag", diag)
+	if !clicked {
+		return nil
 	}
 
-	if req.ReturnScreenshot {
-		shot, err := b.screenshot(ctx)
-		if err != nil {
-			return nil, "", fmt.Errorf("capture screenshot: %w", err)
-		}
-		result.Screenshot = shot
+	_ = sleepContext(ctx, 5*time.Second)
+	token, err := b.readTurnstileToken(ctx)
+	if err != nil || token == "" {
+		b.logger.Info("turnstile token still empty after click")
+		return nil
 	}
-
-	return result, message, nil
+	result.TurnstileToken = token
+	b.logger.Info("turnstile token captured after click", "len", len(token))
+	if fresh, err := b.sess.Cookies(ctx); err == nil && len(fresh) > 0 {
+		result.Cookies = fresh
+	}
+	return nil
 }
+
+func (b *geckoBrowser) PageLogger() Logger      { return b.logger }
+func (b *geckoBrowser) LogHTMLConfigured() bool { return b.cfg.LogHTML }
 
 func (b *geckoBrowser) navigate(ctx context.Context, req Request) error {
 	targetURL := req.URL
@@ -544,42 +458,8 @@ func (b *geckoBrowser) navigate(ctx context.Context, req Request) error {
 		htmlDoc := buildPostFormHTML(req.URL, req.PostData)
 		targetURL = "data:text/html;charset=utf-8," + url.PathEscape(htmlDoc)
 	}
-	_, _, err := b.webDriverRequest(ctx, http.MethodPost, b.sessionPath("/url"), map[string]any{"url": targetURL})
+	_, _, err := b.sess.Do(ctx, http.MethodPost, b.sess.Path("/url"), map[string]any{"url": targetURL})
 	return err
-}
-
-func (b *geckoBrowser) setCookies(ctx context.Context, rawURL string, cookies []Cookie) error {
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return err
-	}
-	domain := parsed.Hostname()
-	secure := strings.EqualFold(parsed.Scheme, "https")
-
-	for _, cookie := range cookies {
-		if cookie.Name == "" {
-			continue
-		}
-		cookiePayload := map[string]any{
-			"name":     cookie.Name,
-			"value":    cookie.Value,
-			"path":     firstCookiePath(cookie.Path),
-			"domain":   firstNonEmpty(cookie.Domain, domain),
-			"secure":   cookie.Secure || secure,
-			"httpOnly": cookie.HTTPOnly,
-		}
-		if strings.TrimSpace(cookie.SameSite) != "" {
-			cookiePayload["sameSite"] = cookie.SameSite
-		}
-		if cookie.Expires > 0 {
-			cookiePayload["expiry"] = int64(cookie.Expires)
-		}
-		payload := map[string]any{"cookie": cookiePayload}
-		if _, _, err := b.webDriverRequest(ctx, http.MethodPost, b.sessionPath("/cookie"), payload); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // solveChallenge polls the page, waiting for Cloudflare's "Verifying..."
@@ -628,15 +508,15 @@ func (b *geckoBrowser) mouseWiggle(ctx context.Context) error {
 			"actions":    buildWiggleActions(points),
 		},
 	}
-	_, _, err := b.webDriverRequest(ctx, http.MethodPost, b.sessionPath("/actions"), map[string]any{
+	_, _, err := b.sess.Do(ctx, http.MethodPost, b.sess.Path("/actions"), map[string]any{
 		"actions": actions,
 	})
 	if err != nil {
 		// Release any half-started action chain.
-		_, _, _ = b.webDriverRequest(ctx, http.MethodDelete, b.sessionPath("/actions"), nil)
+		_, _, _ = b.sess.Do(ctx, http.MethodDelete, b.sess.Path("/actions"), nil)
 		return err
 	}
-	_, _, _ = b.webDriverRequest(ctx, http.MethodDelete, b.sessionPath("/actions"), nil)
+	_, _, _ = b.sess.Do(ctx, http.MethodDelete, b.sess.Path("/actions"), nil)
 	return nil
 }
 
@@ -658,7 +538,7 @@ func buildWiggleActions(points []struct{ x, y int }) []map[string]any {
 // ---------- DOM probes ----------
 
 func (b *geckoBrowser) challengePresent(ctx context.Context) (bool, error) {
-	title, err := b.pageTitle(ctx)
+	title, err := b.sess.Title(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -668,7 +548,7 @@ func (b *geckoBrowser) challengePresent(ctx context.Context) (bool, error) {
 		}
 	}
 	for _, selector := range challengeSelectors {
-		exists, err := b.selectorExists(ctx, selector)
+		exists, err := b.sess.SelectorExists(ctx, selector)
 		if err != nil {
 			return false, err
 		}
@@ -679,90 +559,11 @@ func (b *geckoBrowser) challengePresent(ctx context.Context) (bool, error) {
 	return false, nil
 }
 
-func (b *geckoBrowser) pageTitle(ctx context.Context) (string, error) {
-	raw, _, err := b.webDriverRequest(ctx, http.MethodGet, b.sessionPath("/title"), nil)
-	if err != nil {
-		return "", err
-	}
-	var title string
-	if err := json.Unmarshal(raw, &title); err != nil {
-		return "", err
-	}
-	return title, nil
-}
-
-func (b *geckoBrowser) currentURL(ctx context.Context) (string, error) {
-	raw, _, err := b.webDriverRequest(ctx, http.MethodGet, b.sessionPath("/url"), nil)
-	if err != nil {
-		return "", err
-	}
-	var current string
-	if err := json.Unmarshal(raw, &current); err != nil {
-		return "", err
-	}
-	return current, nil
-}
-
-func (b *geckoBrowser) pageHTML(ctx context.Context) (string, error) {
-	return b.executeString(ctx, `document.documentElement ? document.documentElement.outerHTML : ''`)
-}
-
-func (b *geckoBrowser) selectorExists(ctx context.Context, selector string) (bool, error) {
-	return b.executeBool(ctx, fmt.Sprintf(`document.querySelector(%q) !== null`, selector))
-}
-
-func (b *geckoBrowser) currentCookies(ctx context.Context) ([]Cookie, error) {
-	raw, _, err := b.webDriverRequest(ctx, http.MethodGet, b.sessionPath("/cookie"), nil)
-	if err != nil {
-		return nil, err
-	}
-	type wdCookie struct {
-		Name     string  `json:"name"`
-		Value    string  `json:"value"`
-		Domain   string  `json:"domain"`
-		Path     string  `json:"path"`
-		HTTPOnly bool    `json:"httpOnly"`
-		Secure   bool    `json:"secure"`
-		SameSite string  `json:"sameSite"`
-		Expiry   float64 `json:"expiry"`
-	}
-	var entries []wdCookie
-	if err := json.Unmarshal(raw, &entries); err != nil {
-		return nil, err
-	}
-	result := make([]Cookie, 0, len(entries))
-	for _, entry := range entries {
-		result = append(result, Cookie{
-			Name:     entry.Name,
-			Value:    entry.Value,
-			Domain:   entry.Domain,
-			Path:     entry.Path,
-			HTTPOnly: entry.HTTPOnly,
-			Secure:   entry.Secure,
-			SameSite: entry.SameSite,
-			Expires:  entry.Expiry,
-		})
-	}
-	return result, nil
-}
-
-func (b *geckoBrowser) screenshot(ctx context.Context) (string, error) {
-	raw, _, err := b.webDriverRequest(ctx, http.MethodGet, b.sessionPath("/screenshot"), nil)
-	if err != nil {
-		return "", err
-	}
-	var encoded string
-	if err := json.Unmarshal(raw, &encoded); err != nil {
-		return "", err
-	}
-	return encoded, nil
-}
-
 func (b *geckoBrowser) userAgent(ctx context.Context) (string, error) {
 	if strings.TrimSpace(b.cachedUserAgent) != "" {
 		return b.cachedUserAgent, nil
 	}
-	ua, err := b.executeString(ctx, `navigator.userAgent`)
+	ua, err := b.sess.ExecuteString(ctx, `navigator.userAgent`)
 	if err != nil {
 		return "", err
 	}
@@ -815,7 +616,7 @@ func (b *geckoBrowser) clickTurnstileCheckbox(ctx context.Context) (bool, string
                     viewportW: window.innerWidth, viewportH: window.innerHeight};
         })()
     `
-	raw, err := b.executeScript(ctx, locate)
+	raw, err := b.sess.Execute(ctx, locate)
 	if err != nil {
 		return false, fmt.Sprintf("locate js err: %v", err)
 	}
@@ -855,13 +656,13 @@ func (b *geckoBrowser) clickTurnstileCheckbox(ctx context.Context) (bool, string
 			},
 		},
 	}
-	if _, _, err := b.webDriverRequest(ctx, http.MethodPost, b.sessionPath("/actions"), map[string]any{
+	if _, _, err := b.sess.Do(ctx, http.MethodPost, b.sess.Path("/actions"), map[string]any{
 		"actions": actions,
 	}); err != nil {
-		_, _, _ = b.webDriverRequest(ctx, http.MethodDelete, b.sessionPath("/actions"), nil)
+		_, _, _ = b.sess.Do(ctx, http.MethodDelete, b.sess.Path("/actions"), nil)
 		return false, diag + " click-actions err: " + err.Error()
 	}
-	_, _, _ = b.webDriverRequest(ctx, http.MethodDelete, b.sessionPath("/actions"), nil)
+	_, _, _ = b.sess.Do(ctx, http.MethodDelete, b.sess.Path("/actions"), nil)
 	return true, diag
 }
 
@@ -887,135 +688,16 @@ func (b *geckoBrowser) readTurnstileToken(ctx context.Context) (string, error) {
             return '';
         })()
     `
-	return b.executeString(ctx, script)
+	return b.sess.ExecuteString(ctx, script)
 }
 
 // ---------- execute helpers ----------
 
-func (b *geckoBrowser) executeString(ctx context.Context, script string) (string, error) {
-	raw, err := b.executeScript(ctx, script)
-	if err != nil {
-		return "", err
-	}
-	var value string
-	if err := json.Unmarshal(raw, &value); err != nil {
-		return "", err
-	}
-	return value, nil
-}
-
-func (b *geckoBrowser) executeBool(ctx context.Context, script string) (bool, error) {
-	raw, err := b.executeScript(ctx, script)
-	if err != nil {
-		return false, err
-	}
-	var value bool
-	if err := json.Unmarshal(raw, &value); err != nil {
-		return false, err
-	}
-	return value, nil
-}
-
-func (b *geckoBrowser) executeScript(ctx context.Context, script string) (json.RawMessage, error) {
-	script = strings.TrimSpace(script)
-	script = strings.TrimSuffix(script, ";")
-	if script == "" {
-		script = "null"
-	}
-	wrapped := "return (" + script + ")"
-	raw, _, err := b.webDriverRequest(ctx, http.MethodPost, b.sessionPath("/execute/sync"), map[string]any{
-		"script": wrapped,
-		"args":   []any{},
-	})
-	return raw, err
-}
-
 // ---------- low-level plumbing ----------
-
-func (b *geckoBrowser) sessionPath(path string) string {
-	return "/session/" + b.sessionID + path
-}
-
-func (b *geckoBrowser) webDriverRequest(ctx context.Context, method, path string, payload any) (json.RawMessage, string, error) {
-	var body io.Reader
-	if payload != nil {
-		data, err := json.Marshal(payload)
-		if err != nil {
-			return nil, "", err
-		}
-		body = bytes.NewReader(data)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, method, b.baseURL+path, body)
-	if err != nil {
-		return nil, "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := b.httpClient.Do(req)
-	if err != nil {
-		return nil, "", err
-	}
-	defer resp.Body.Close()
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, "", err
-	}
-
-	var envelope struct {
-		Value     json.RawMessage `json:"value"`
-		SessionID string          `json:"sessionId"`
-	}
-	if len(data) > 0 {
-		if err := json.Unmarshal(data, &envelope); err != nil {
-			if resp.StatusCode >= 400 {
-				return nil, "", fmt.Errorf("geckodriver http %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
-			}
-			return nil, "", err
-		}
-	}
-
-	if resp.StatusCode >= 400 {
-		var wdErr struct {
-			Error   string `json:"error"`
-			Message string `json:"message"`
-		}
-		if len(envelope.Value) > 0 && json.Unmarshal(envelope.Value, &wdErr) == nil && strings.TrimSpace(wdErr.Message) != "" {
-			return nil, envelope.SessionID, fmt.Errorf("%s", wdErr.Message)
-		}
-		return nil, envelope.SessionID, fmt.Errorf("geckodriver http %d", resp.StatusCode)
-	}
-
-	return envelope.Value, envelope.SessionID, nil
-}
-
-func (b *geckoBrowser) deleteSession(ctx context.Context) {
-	if strings.TrimSpace(b.sessionID) == "" || strings.TrimSpace(b.baseURL) == "" {
-		return
-	}
-	_, _, _ = b.webDriverRequest(ctx, http.MethodDelete, b.sessionPath(""), nil)
-	b.sessionID = ""
-}
-
-func (b *geckoBrowser) driverLogTail() string {
-	if b.driverLogPath == "" {
-		return ""
-	}
-	data, err := os.ReadFile(b.driverLogPath)
-	if err != nil {
-		return ""
-	}
-	const maxTail = 4 * 1024
-	if len(data) > maxTail {
-		data = data[len(data)-maxTail:]
-	}
-	return strings.TrimSpace(string(data))
-}
 
 // ---------- headless / display ----------
 
-func (b *geckoBrowser) prepareHeadlessMode() (bool, string, error) {
+func (b *geckoBrowser) prepareHeadlessMode(ctx context.Context) (bool, string, error) {
 	if !b.cfg.Headless || runtime.GOOS == "windows" {
 		return b.cfg.Headless, "", nil
 	}
@@ -1029,7 +711,7 @@ func (b *geckoBrowser) prepareHeadlessMode() (bool, string, error) {
 		b.logger.Warn("HEADLESS=true without DISPLAY or Xvfb; falling back to Firefox -headless mode")
 		return true, "", nil
 	}
-	proc, display, err := browserpkg.StartXvfb(xvfbPath)
+	proc, display, err := browserpkg.StartXvfb(ctx, xvfbPath)
 	if err != nil {
 		return false, "", err
 	}
@@ -1071,15 +753,6 @@ func (b *geckoBrowser) cleanupProfileDir() {
 }
 
 // ---------- helpers ----------
-
-func freeLocalPort() (int, error) {
-	lst, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, err
-	}
-	defer lst.Close()
-	return lst.Addr().(*net.TCPAddr).Port, nil
-}
 
 func splitArgs(raw string) []string {
 	raw = strings.TrimSpace(raw)

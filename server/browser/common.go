@@ -440,12 +440,12 @@ func (p *XvfbProcess) Stop() error {
 	return <-p.exitCh
 }
 
-func StartXvfb(xvfbPath string) (*XvfbProcess, string, error) {
-	if proc, display, err := startXvfbWithDisplayFD(xvfbPath); err == nil {
+func StartXvfb(ctx context.Context, xvfbPath string) (*XvfbProcess, string, error) {
+	if proc, display, err := startXvfbWithDisplayFD(ctx, xvfbPath); err == nil {
 		return proc, display, nil
 	}
 
-	return startXvfbWithRange(xvfbPath)
+	return startXvfbWithRange(ctx, xvfbPath)
 }
 
 func CreateTransientDir(prefix string) (string, error) {
@@ -544,7 +544,7 @@ func canonicalizeURL(raw string) string {
 	return parsed.String()
 }
 
-func startXvfbWithDisplayFD(xvfbPath string) (*XvfbProcess, string, error) {
+func startXvfbWithDisplayFD(ctx context.Context, xvfbPath string) (*XvfbProcess, string, error) {
 	reader, writer, err := os.Pipe()
 	if err != nil {
 		return nil, "", fmt.Errorf("create Xvfb pipe: %w", err)
@@ -606,13 +606,23 @@ func startXvfbWithDisplayFD(xvfbPath string) (*XvfbProcess, string, error) {
 		_ = cmd.Process.Kill()
 		<-exitCh
 		return nil, "", fmt.Errorf("start Xvfb with -displayfd: timeout waiting for display%s", formatXvfbStderr(stderr.String()))
+	case <-ctx.Done():
+		_ = cmd.Process.Kill()
+		<-exitCh
+		return nil, "", fmt.Errorf("start Xvfb with -displayfd: %w", ctx.Err())
 	}
 }
 
-func startXvfbWithRange(xvfbPath string) (*XvfbProcess, string, error) {
+func startXvfbWithRange(ctx context.Context, xvfbPath string) (*XvfbProcess, string, error) {
 	var lastErr error
 
 	for displayNumber := 99; displayNumber < 200; displayNumber++ {
+		if err := ctx.Err(); err != nil {
+			if lastErr != nil {
+				return nil, "", fmt.Errorf("start Xvfb: %w (last error: %v)", err, lastErr)
+			}
+			return nil, "", fmt.Errorf("start Xvfb: %w", err)
+		}
 		lockPath := fmt.Sprintf("/tmp/.X%d-lock", displayNumber)
 		socketPath := fmt.Sprintf("/tmp/.X11-unix/X%d", displayNumber)
 		if _, err := os.Stat(socketPath); err == nil {
@@ -652,7 +662,11 @@ func startXvfbWithRange(xvfbPath string) (*XvfbProcess, string, error) {
 			if _, err := os.Stat(socketPath); err == nil {
 				return &XvfbProcess{cmd: cmd, exitCh: exitCh}, display, nil
 			}
-			time.Sleep(100 * time.Millisecond)
+			if err := SleepContext(ctx, 100*time.Millisecond); err != nil {
+				failed = true
+				lastErr = err
+				break
+			}
 		}
 
 		_ = cmd.Process.Kill()

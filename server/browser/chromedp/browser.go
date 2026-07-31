@@ -85,7 +85,7 @@ type chromedpBrowser struct {
 	mu sync.Mutex
 }
 
-func NewChromedp(cfg Config, proxy *Proxy) (Client, error) {
+func NewChromedp(ctx context.Context, cfg Config, proxy *Proxy) (Client, error) {
 	b := &chromedpBrowser{
 		cfg:             cfg,
 		logger:          cfg.Logger,
@@ -97,7 +97,7 @@ func NewChromedp(cfg Config, proxy *Proxy) (Client, error) {
 		return nil, err
 	}
 
-	opts, err := b.execAllocatorOptions()
+	opts, err := b.execAllocatorOptions(ctx)
 	if err != nil {
 		b.cleanupUserDataDir()
 		b.stopDisplay()
@@ -126,9 +126,9 @@ func NewChromedp(cfg Config, proxy *Proxy) (Client, error) {
 	return b, nil
 }
 
-func (b *chromedpBrowser) execAllocatorOptions() ([]chromedp.ExecAllocatorOption, error) {
+func (b *chromedpBrowser) execAllocatorOptions(ctx context.Context) ([]chromedp.ExecAllocatorOption, error) {
 	env := os.Environ()
-	effectiveHeadless, display, err := b.prepareHeadlessMode()
+	effectiveHeadless, display, err := b.prepareHeadlessMode(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -351,7 +351,7 @@ func (b *chromedpBrowser) installStealth() error {
 	)
 }
 
-func (b *chromedpBrowser) prepareHeadlessMode() (bool, string, error) {
+func (b *chromedpBrowser) prepareHeadlessMode(ctx context.Context) (bool, string, error) {
 	if !b.cfg.Headless || runtime.GOOS == "windows" {
 		return b.cfg.Headless, "", nil
 	}
@@ -366,15 +366,15 @@ func (b *chromedpBrowser) prepareHeadlessMode() (bool, string, error) {
 		return true, "", nil
 	}
 
-	display, err := b.startDisplay(xvfbPath)
+	display, err := b.startDisplay(ctx, xvfbPath)
 	if err != nil {
 		return false, "", err
 	}
 	return false, display, nil
 }
 
-func (b *chromedpBrowser) startDisplay(xvfbPath string) (string, error) {
-	proc, display, err := browserpkg.StartXvfb(xvfbPath)
+func (b *chromedpBrowser) startDisplay(ctx context.Context, xvfbPath string) (string, error) {
+	proc, display, err := browserpkg.StartXvfb(ctx, xvfbPath)
 	if err != nil {
 		return "", err
 	}
@@ -458,6 +458,16 @@ func (b *chromedpBrowser) Close() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	// chromedp.Cancel, unlike the bare cancel funcs, waits for the browser
+	// process to actually exit. Cancelling and deleting straight away races a
+	// still-running Chrome, which then recreates its profile files after the
+	// RemoveAll below — leaking one scratch dir per request.
+	if b.browserCtx != nil {
+		if err := chromedp.Cancel(b.browserCtx); err != nil {
+			b.logger.Debug("wait for chrome to exit failed", "err", err)
+		}
+		b.browserCtx = nil
+	}
 	if b.browserStop != nil {
 		b.browserStop()
 		b.browserStop = nil
@@ -573,142 +583,92 @@ func (b *chromedpBrowser) newRunContext(parent context.Context, timeout time.Dur
 }
 
 func (b *chromedpBrowser) resolve(ctx context.Context, req Request) (*ChallengeResolutionResult, string, error) {
+	// Backend-specific: the CDP listener accumulates the main-document response
+	// per navigation, so it has to be cleared before each request.
 	b.resetDocumentResponse()
-
-	// Applied on every request, empty when media is allowed. Setting it only
-	// when DisableMedia was true and never clearing it made disableMedia:true
-	// sticky for the rest of the session.
-	{
-		patterns := make([]*network.BlockPattern, 0, len(blockedURLs))
-		if req.DisableMedia {
-			for _, pattern := range blockedURLs {
-				patterns = append(patterns, &network.BlockPattern{
-					URLPattern: normalizeBlockedPattern(pattern),
-					Block:      true,
-				})
-			}
-		}
-		if err := chromedp.Run(ctx,
-			network.Enable(),
-			network.SetBlockedURLs().WithURLPatterns(patterns),
-		); err != nil {
-			b.logger.Debug("Network.setBlockedURLs failed", "err", err)
-		}
-	}
-
-	if err := b.navigate(ctx, req); err != nil {
-		return nil, "", fmt.Errorf("navigate: %w", err)
-	}
-
-	if len(req.Cookies) > 0 {
-		if err := b.setCookies(ctx, req.URL, req.Cookies); err != nil {
-			return nil, "", fmt.Errorf("set cookies: %w", err)
-		}
-		if err := b.navigate(ctx, req); err != nil {
-			return nil, "", fmt.Errorf("reload after cookies: %w", err)
-		}
-	}
-
-	if req.LogHTML || b.cfg.LogHTML {
-		if _, err := b.pageHTML(ctx); err != nil {
-			b.logger.Debug("response html read failed", "err", err)
-		}
-	}
-
-	title, err := b.pageTitle(ctx)
-	if err != nil {
-		return nil, "", fmt.Errorf("read page title: %w", err)
-	}
-	for _, accessTitle := range accessDeniedTitles {
-		if strings.HasPrefix(title, accessTitle) {
-			return nil, "", fmt.Errorf("Cloudflare has blocked this request. Probably your IP is banned for this site, check in your web browser.")
-		}
-	}
-	for _, selector := range accessDeniedSelectors {
-		exists, err := b.selectorExists(ctx, selector)
-		if err != nil {
-			return nil, "", fmt.Errorf("check access denied selector %q: %w", selector, err)
-		}
-		if exists {
-			return nil, "", fmt.Errorf("Cloudflare has blocked this request. Probably your IP is banned for this site, check in your web browser.")
-		}
-	}
-
-	message := "Challenge not detected!"
-	challengeFound, err := b.challengePresent(ctx)
-	if err != nil {
-		return nil, "", fmt.Errorf("detect challenge: %w", err)
-	}
-	if challengeFound {
-		if err := b.solveChallenge(ctx); err != nil {
-			return nil, "", fmt.Errorf("solve challenge: %w", err)
-		}
-		message = "Challenge solved!"
-	}
-
-	// Wait BEFORE reading currentURL/cookies/HTML. For request.post the form
-	// submission is driven from a data:URL — the browser is still navigating
-	// to the real target when we get here, so reading cookies now returns a
-	// jar scoped to data: (i.e. empty). Letting WaitInSeconds elapse first
-	// guarantees the snapshot reflects the post-navigation state.
-	if req.WaitInSeconds > 0 {
-		if err := sleepContext(ctx, time.Duration(req.WaitInSeconds)*time.Second); err != nil {
-			return nil, "", fmt.Errorf("wait after challenge: %w", err)
-		}
-	}
-
-	currentURL, err := b.currentURL(ctx)
-	if err != nil {
-		return nil, "", fmt.Errorf("read current url: %w", err)
-	}
-	userAgent, err := b.userAgent(ctx)
-	if err != nil {
-		return nil, "", fmt.Errorf("read user agent: %w", err)
-	}
-	cookies, err := b.currentCookies(ctx, currentURL)
-	if err != nil {
-		return nil, "", fmt.Errorf("read cookies: %w", err)
-	}
-
-	result := &ChallengeResolutionResult{
-		URL:       currentURL,
-		Status:    200,
-		Cookies:   cookies,
-		UserAgent: userAgent,
-	}
-	if docResp := b.documentResponse(currentURL); docResp.Status > 0 {
-		result.Status = docResp.Status
-		if len(docResp.Headers) > 0 {
-			result.Headers = docResp.Headers
-		}
-	}
-
-	if req.TabsTillVerify != nil {
-		token, err := b.resolveTurnstileToken(ctx, max(*req.TabsTillVerify, 1))
-		if err != nil {
-			return nil, "", fmt.Errorf("read turnstile token: %w", err)
-		}
-		result.TurnstileToken = token
-	}
-
-	if !req.ReturnOnlyCookies {
-		htmlDoc, err := b.pageHTML(ctx)
-		if err != nil {
-			return nil, "", fmt.Errorf("read response html: %w", err)
-		}
-		result.Response = htmlDoc
-	}
-
-	if req.ReturnScreenshot {
-		var screenshot []byte
-		if err := chromedp.Run(ctx, chromedp.CaptureScreenshot(&screenshot)); err != nil {
-			return nil, "", fmt.Errorf("capture screenshot: %w", err)
-		}
-		result.Screenshot = base64.StdEncoding.EncodeToString(screenshot)
-	}
-
-	return result, message, nil
+	return browserpkg.ResolvePage(ctx, b, req)
 }
+
+// ---------- browser.Page ----------
+
+func (b *chromedpBrowser) SetMediaBlocked(ctx context.Context, blocked bool) error {
+	patterns := make([]*network.BlockPattern, 0, len(blockedURLs))
+	if blocked {
+		for _, pattern := range blockedURLs {
+			patterns = append(patterns, &network.BlockPattern{
+				URLPattern: normalizeBlockedPattern(pattern),
+				Block:      true,
+			})
+		}
+	}
+	return chromedp.Run(ctx,
+		network.Enable(),
+		network.SetBlockedURLs().WithURLPatterns(patterns),
+	)
+}
+
+func (b *chromedpBrowser) Navigate(ctx context.Context, req Request) error {
+	return b.navigate(ctx, req)
+}
+
+func (b *chromedpBrowser) SetPageCookies(ctx context.Context, rawURL string, cookies []Cookie) error {
+	return b.setCookies(ctx, rawURL, cookies)
+}
+
+func (b *chromedpBrowser) Title(ctx context.Context) (string, error) { return b.pageTitle(ctx) }
+
+func (b *chromedpBrowser) SelectorExists(ctx context.Context, selector string) (bool, error) {
+	return b.selectorExists(ctx, selector)
+}
+
+func (b *chromedpBrowser) HTML(ctx context.Context) (string, error) { return b.pageHTML(ctx) }
+
+func (b *chromedpBrowser) CurrentURL(ctx context.Context) (string, error) {
+	return b.currentURL(ctx)
+}
+
+func (b *chromedpBrowser) PageUserAgent(ctx context.Context) (string, error) {
+	return b.userAgent(ctx)
+}
+
+func (b *chromedpBrowser) PageCookies(ctx context.Context, currentURL string) ([]Cookie, error) {
+	return b.currentCookies(ctx, currentURL)
+}
+
+func (b *chromedpBrowser) Screenshot(ctx context.Context) (string, error) {
+	var screenshot []byte
+	if err := chromedp.Run(ctx, chromedp.CaptureScreenshot(&screenshot)); err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(screenshot), nil
+}
+
+func (b *chromedpBrowser) ChallengePresent(ctx context.Context) (bool, error) {
+	return b.challengePresent(ctx)
+}
+
+func (b *chromedpBrowser) SolveChallenge(ctx context.Context) error {
+	return b.solveChallenge(ctx)
+}
+
+func (b *chromedpBrowser) DocumentResponse(_ context.Context, currentURL string) (documentResponse, error) {
+	return b.documentResponse(currentURL), nil
+}
+
+func (b *chromedpBrowser) ApplyTurnstileToken(ctx context.Context, req Request, result *ChallengeResolutionResult) error {
+	if req.TabsTillVerify == nil {
+		return nil
+	}
+	token, err := b.resolveTurnstileToken(ctx, max(*req.TabsTillVerify, 1))
+	if err != nil {
+		return err
+	}
+	result.TurnstileToken = token
+	return nil
+}
+
+func (b *chromedpBrowser) PageLogger() Logger      { return b.logger }
+func (b *chromedpBrowser) LogHTMLConfigured() bool { return b.cfg.LogHTML }
 
 func (b *chromedpBrowser) navigate(ctx context.Context, req Request) error {
 	if strings.EqualFold(req.Method, "POST") {

@@ -1,14 +1,11 @@
 package webdriverbackend
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -17,10 +14,10 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	browserpkg "github.com/trinity-aml/flaresolverr-go/server/browser"
+	"github.com/trinity-aml/flaresolverr-go/server/browser/w3c"
 )
 
 type Config = browserpkg.Config
@@ -70,16 +67,13 @@ type webDriverBrowser struct {
 	logger Logger
 	proxy  *Proxy
 
-	httpClient        *http.Client
-	baseURL           string
-	sessionID         string
+	sess              *w3c.Session
 	effectiveHeadless bool
 
-	driverCmd         *exec.Cmd
+	driver            *w3c.DriverProcess
 	patchedDriverDir  string
 	patchedDriverPath string
 	driverRuntimeDir  string
-	driverLogPath     string
 	cachedUserAgent   string
 
 	xvfbProc        *browserpkg.XvfbProcess
@@ -93,14 +87,15 @@ type webDriverBrowser struct {
 	mu sync.Mutex
 }
 
-func NewWebDriver(cfg Config, proxy *Proxy) (Client, error) {
+func NewWebDriver(ctx context.Context, cfg Config, proxy *Proxy) (Client, error) {
 	b := &webDriverBrowser{
 		cfg:             cfg,
 		logger:          cfg.Logger,
 		proxy:           proxy,
 		previousDisplay: os.Getenv("DISPLAY"),
-		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
+		sess: &w3c.Session{
+			HTTP:      &http.Client{Timeout: 30 * time.Second},
+			ErrPrefix: "webdriver",
 		},
 	}
 
@@ -115,15 +110,15 @@ func NewWebDriver(cfg Config, proxy *Proxy) (Client, error) {
 		_ = b.Close()
 		return nil, err
 	}
-	if err := b.startDriver(); err != nil {
+	if err := b.startDriver(ctx); err != nil {
 		_ = b.Close()
 		return nil, err
 	}
-	if err := b.createSession(); err != nil {
+	if err := b.createSession(ctx); err != nil {
 		_ = b.Close()
 		return nil, err
 	}
-	if err := b.installStealth(); err != nil {
+	if err := b.installStealth(ctx); err != nil {
 		_ = b.Close()
 		return nil, err
 	}
@@ -164,9 +159,9 @@ func (b *webDriverBrowser) Close() error {
 	// a wedged chromedriver would otherwise stall shutdown for the full 30s
 	// httpClient timeout per session.
 	deleteCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	b.deleteSession(deleteCtx)
+	b.sess.Delete(deleteCtx)
 	cancel()
-	b.stopDriver()
+	b.driver.Stop()
 	if b.patchedDriverDir != "" {
 		_ = os.RemoveAll(b.patchedDriverDir)
 		b.patchedDriverDir = ""
@@ -186,37 +181,6 @@ func (b *webDriverBrowser) Close() error {
 	return nil
 }
 
-// stopDriver gives chromedriver a grace period to exit on its own (DELETE
-// /session above asks it to), then escalates to SIGTERM and finally SIGKILL.
-// Killing outright orphans the Chrome child process, which then keeps its
-// user-data-dir alive after we have deleted the parent's scratch dirs.
-func (b *webDriverBrowser) stopDriver() {
-	if b.driverCmd == nil || b.driverCmd.Process == nil {
-		return
-	}
-	done := make(chan error, 1)
-	go func() { done <- b.driverCmd.Wait() }()
-
-	select {
-	case <-done:
-		b.driverCmd = nil
-		return
-	case <-time.After(3 * time.Second):
-	}
-
-	_ = b.driverCmd.Process.Signal(syscall.SIGTERM)
-	select {
-	case <-done:
-		b.driverCmd = nil
-		return
-	case <-time.After(2 * time.Second):
-	}
-
-	_ = b.driverCmd.Process.Kill()
-	<-done
-	b.driverCmd = nil
-}
-
 func (b *webDriverBrowser) preparePatchedDriver() error {
 	driverPath := b.cfg.DriverPath
 	if strings.TrimSpace(driverPath) == "" {
@@ -232,13 +196,13 @@ func (b *webDriverBrowser) preparePatchedDriver() error {
 	return nil
 }
 
-func (b *webDriverBrowser) startDriver() error {
-	port, err := freeLocalPort()
+func (b *webDriverBrowser) startDriver(ctx context.Context) error {
+	port, err := w3c.FreeLocalPort()
 	if err != nil {
 		return fmt.Errorf("reserve chromedriver port: %w", err)
 	}
 
-	effectiveHeadless, display, err := b.prepareHeadlessMode()
+	effectiveHeadless, display, err := b.prepareHeadlessMode(ctx)
 	if err != nil {
 		return err
 	}
@@ -249,47 +213,32 @@ func (b *webDriverBrowser) startDriver() error {
 		env = appendWithEnv(env, "DISPLAY", display)
 	}
 
-	cmdArgs := []string{
-		fmt.Sprintf("--port=%d", port),
-		"--allowed-origins=*",
+	spec := w3c.DriverSpec{
+		Name: "chromedriver",
+		Path: b.patchedDriverPath,
+		Args: []string{
+			fmt.Sprintf("--port=%d", port),
+			"--allowed-origins=*",
+		},
+		Env: env,
 	}
-	b.driverLogPath = ""
 	if b.cfg.DebugLogging {
 		if err := b.prepareDriverRuntimeDir(); err != nil {
 			return err
 		}
-		b.driverLogPath = filepath.Join(b.driverRuntimeDir, "chromedriver.log")
-		cmdArgs = append(cmdArgs, "--verbose", "--log-path="+b.driverLogPath)
-	}
-	cmd := exec.Command(b.patchedDriverPath, cmdArgs...)
-	cmd.Env = env
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start chromedriver: %w", err)
+		// chromedriver writes the log itself, so no output redirection.
+		spec.LogPath = filepath.Join(b.driverRuntimeDir, "chromedriver.log")
+		spec.Args = append(spec.Args, "--verbose", "--log-path="+spec.LogPath)
 	}
 
-	b.driverCmd = cmd
-	b.baseURL = fmt.Sprintf("http://127.0.0.1:%d", port)
+	b.sess.BaseURL = fmt.Sprintf("http://127.0.0.1:%d", port)
 
-	deadline := time.Now().Add(15 * time.Second)
-	waitFor := 50 * time.Millisecond
-	for time.Now().Before(deadline) {
-		statusCtx, cancel := context.WithTimeout(context.Background(), time.Second)
-		_, _, err := b.webDriverRequest(statusCtx, http.MethodGet, "/status", nil)
-		cancel()
-		if err == nil {
-			return nil
-		}
-		time.Sleep(waitFor)
-		if waitFor < 500*time.Millisecond {
-			waitFor *= 2
-			if waitFor > 500*time.Millisecond {
-				waitFor = 500 * time.Millisecond
-			}
-		}
+	driver, err := w3c.StartDriver(ctx, spec, b.sess)
+	if err != nil {
+		return err
 	}
-	return fmt.Errorf("chromedriver did not become ready")
+	b.driver = driver
+	return nil
 }
 
 func (b *webDriverBrowser) prepareDriverRuntimeDir() error {
@@ -304,7 +253,7 @@ func (b *webDriverBrowser) prepareDriverRuntimeDir() error {
 	return nil
 }
 
-func (b *webDriverBrowser) createSession() error {
+func (b *webDriverBrowser) createSession(ctx context.Context) error {
 	args := b.chromeArgs()
 	b.logger.Debug("creating webdriver session", "browser_path", b.cfg.BrowserPath, "headless", b.cfg.Headless, "effective_headless", b.effectiveHeadless, "display", os.Getenv("DISPLAY"), "args", args)
 
@@ -332,9 +281,9 @@ func (b *webDriverBrowser) createSession() error {
 		},
 	}
 
-	raw, topSessionID, err := b.webDriverRequest(context.Background(), http.MethodPost, "/session", payload)
+	raw, topSessionID, err := b.sess.Do(context.Background(), http.MethodPost, "/session", payload)
 	if err != nil {
-		if tail := b.driverLogTail(); tail != "" {
+		if tail := b.driver.LogTail(); tail != "" {
 			return fmt.Errorf("create webdriver session: %w | chromedriver log: %s", err, tail)
 		}
 		return fmt.Errorf("create webdriver session: %w", err)
@@ -353,7 +302,7 @@ func (b *webDriverBrowser) createSession() error {
 		return fmt.Errorf("webdriver session id missing")
 	}
 
-	b.sessionID = sessionID
+	b.sess.ID = sessionID
 	return nil
 }
 
@@ -403,7 +352,7 @@ func (b *webDriverBrowser) chromeArgs() []string {
 	return args
 }
 
-func (b *webDriverBrowser) installStealth() error {
+func (b *webDriverBrowser) installStealth(ctx context.Context) error {
 	// Stealth patches applied on every new document to reduce automation
 	// fingerprint signals that CF Managed Challenge uses for botting decisions.
 	// Covers: navigator.webdriver, real PluginArray/MimeTypeArray mimic,
@@ -646,137 +595,81 @@ func (b *webDriverBrowser) installStealth() error {
 }
 
 func (b *webDriverBrowser) resolve(ctx context.Context, req Request) (*ChallengeResolutionResult, string, error) {
-	// Set the block list on every request, empty when media is allowed. It used
-	// to be applied only when DisableMedia was true and never cleared, so
-	// disableMedia:true on one request kept blocking CSS/images for every later
-	// request on the same session.
-	{
-		urls := make([]string, 0, len(blockedURLs))
-		if req.DisableMedia {
-			for _, pattern := range blockedURLs {
-				urls = append(urls, normalizeBlockedPattern(pattern))
-			}
-		}
-		_, _ = b.executeCDP(ctx, "Network.enable", map[string]any{})
-		_, _ = b.executeCDP(ctx, "Network.setBlockedURLs", map[string]any{"urls": urls})
-	}
-
-	if err := b.navigate(ctx, req); err != nil {
-		return nil, "", fmt.Errorf("navigate: %w", err)
-	}
-
-	if len(req.Cookies) > 0 {
-		if err := b.setCookies(ctx, req.URL, req.Cookies); err != nil {
-			return nil, "", fmt.Errorf("set cookies: %w", err)
-		}
-		if err := b.navigate(ctx, req); err != nil {
-			return nil, "", fmt.Errorf("reload after cookies: %w", err)
-		}
-	}
-
-	if req.LogHTML || b.cfg.LogHTML {
-		if _, err := b.pageHTML(ctx); err != nil {
-			b.logger.Debug("response html read failed", "err", err)
-		}
-	}
-
-	title, err := b.pageTitle(ctx)
-	if err != nil {
-		return nil, "", fmt.Errorf("read page title: %w", err)
-	}
-	for _, accessTitle := range accessDeniedTitles {
-		if strings.HasPrefix(title, accessTitle) {
-			return nil, "", fmt.Errorf("Cloudflare has blocked this request. Probably your IP is banned for this site, check in your web browser.")
-		}
-	}
-	for _, selector := range accessDeniedSelectors {
-		exists, err := b.selectorExists(ctx, selector)
-		if err != nil {
-			return nil, "", fmt.Errorf("check access denied selector %q: %w", selector, err)
-		}
-		if exists {
-			return nil, "", fmt.Errorf("Cloudflare has blocked this request. Probably your IP is banned for this site, check in your web browser.")
-		}
-	}
-
-	message := "Challenge not detected!"
-	challengeFound, err := b.challengePresent(ctx)
-	if err != nil {
-		return nil, "", fmt.Errorf("detect challenge: %w", err)
-	}
-	if challengeFound {
-		if err := b.solveChallenge(ctx); err != nil {
-			return nil, "", fmt.Errorf("solve challenge: %w", err)
-		}
-		message = "Challenge solved!"
-	}
-
-	// Wait BEFORE reading currentURL/cookies/HTML. For request.post the form
-	// submission is driven from a data:URL — the browser is still navigating
-	// to the real target when we get here, and the WebDriver /cookie endpoint
-	// is scoped to the current page's origin (data:), so reading the jar now
-	// returns an empty list. Letting WaitInSeconds elapse first lets the
-	// post-navigation snapshot include the real currentURL and cookies.
-	if req.WaitInSeconds > 0 {
-		if err := sleepContext(ctx, time.Duration(req.WaitInSeconds)*time.Second); err != nil {
-			return nil, "", fmt.Errorf("wait after challenge: %w", err)
-		}
-	}
-
-	currentURL, err := b.currentURL(ctx)
-	if err != nil {
-		return nil, "", fmt.Errorf("read current url: %w", err)
-	}
-	userAgent, err := b.userAgent(ctx)
-	if err != nil {
-		return nil, "", fmt.Errorf("read user agent: %w", err)
-	}
-	cookies, err := b.currentCookies(ctx)
-	if err != nil {
-		return nil, "", fmt.Errorf("read cookies: %w", err)
-	}
-
-	result := &ChallengeResolutionResult{
-		URL:       currentURL,
-		Status:    200,
-		Cookies:   cookies,
-		UserAgent: userAgent,
-	}
-	if docResp, err := b.documentResponse(ctx, currentURL); err == nil && docResp.Status > 0 {
-		result.Status = docResp.Status
-		if len(docResp.Headers) > 0 {
-			result.Headers = docResp.Headers
-		}
-	} else if err != nil {
-		b.logger.Debug("read document response headers failed", "err", err)
-	}
-
-	if req.TabsTillVerify != nil {
-		token, err := b.resolveTurnstileToken(ctx, max(*req.TabsTillVerify, 1))
-		if err != nil {
-			return nil, "", fmt.Errorf("read turnstile token: %w", err)
-		}
-		result.TurnstileToken = token
-	}
-
-	if !req.ReturnOnlyCookies {
-		htmlDoc, err := b.pageHTML(ctx)
-		if err != nil {
-			return nil, "", fmt.Errorf("read response html: %w", err)
-		}
-		result.Response = htmlDoc
-	}
-
-	if req.ReturnScreenshot {
-		screenshot, err := b.screenshot(ctx)
-		if err != nil {
-			return nil, "", fmt.Errorf("capture screenshot: %w", err)
-		}
-		result.Screenshot = screenshot
-	}
-
-	return result, message, nil
+	return browserpkg.ResolvePage(ctx, b, req)
 }
+
+// ---------- browser.Page ----------
+
+func (b *webDriverBrowser) SetMediaBlocked(ctx context.Context, blocked bool) error {
+	urls := make([]string, 0, len(blockedURLs))
+	if blocked {
+		for _, pattern := range blockedURLs {
+			urls = append(urls, normalizeBlockedPattern(pattern))
+		}
+	}
+	if _, err := b.executeCDP(ctx, "Network.enable", map[string]any{}); err != nil {
+		return err
+	}
+	_, err := b.executeCDP(ctx, "Network.setBlockedURLs", map[string]any{"urls": urls})
+	return err
+}
+
+func (b *webDriverBrowser) Navigate(ctx context.Context, req Request) error {
+	return b.navigate(ctx, req)
+}
+
+func (b *webDriverBrowser) SetPageCookies(ctx context.Context, rawURL string, cookies []Cookie) error {
+	return b.sess.SetCookies(ctx, rawURL, cookies)
+}
+
+func (b *webDriverBrowser) Title(ctx context.Context) (string, error) { return b.sess.Title(ctx) }
+
+func (b *webDriverBrowser) SelectorExists(ctx context.Context, selector string) (bool, error) {
+	return b.sess.SelectorExists(ctx, selector)
+}
+
+func (b *webDriverBrowser) HTML(ctx context.Context) (string, error) { return b.sess.HTML(ctx) }
+
+func (b *webDriverBrowser) CurrentURL(ctx context.Context) (string, error) { return b.sess.URL(ctx) }
+
+func (b *webDriverBrowser) PageUserAgent(ctx context.Context) (string, error) {
+	return b.userAgent(ctx)
+}
+
+func (b *webDriverBrowser) PageCookies(ctx context.Context, _ string) ([]Cookie, error) {
+	return b.sess.Cookies(ctx)
+}
+
+func (b *webDriverBrowser) Screenshot(ctx context.Context) (string, error) {
+	return b.sess.Screenshot(ctx)
+}
+
+func (b *webDriverBrowser) ChallengePresent(ctx context.Context) (bool, error) {
+	return b.challengePresent(ctx)
+}
+
+func (b *webDriverBrowser) SolveChallenge(ctx context.Context) error {
+	return b.solveChallenge(ctx)
+}
+
+func (b *webDriverBrowser) DocumentResponse(ctx context.Context, currentURL string) (documentResponse, error) {
+	return b.documentResponse(ctx, currentURL)
+}
+
+func (b *webDriverBrowser) ApplyTurnstileToken(ctx context.Context, req Request, result *ChallengeResolutionResult) error {
+	if req.TabsTillVerify == nil {
+		return nil
+	}
+	token, err := b.resolveTurnstileToken(ctx, max(*req.TabsTillVerify, 1))
+	if err != nil {
+		return err
+	}
+	result.TurnstileToken = token
+	return nil
+}
+
+func (b *webDriverBrowser) PageLogger() Logger      { return b.logger }
+func (b *webDriverBrowser) LogHTMLConfigured() bool { return b.cfg.LogHTML }
 
 func (b *webDriverBrowser) navigate(ctx context.Context, req Request) error {
 	targetURL := req.URL
@@ -784,43 +677,8 @@ func (b *webDriverBrowser) navigate(ctx context.Context, req Request) error {
 		htmlDoc := buildPostFormHTML(req.URL, req.PostData)
 		targetURL = "data:text/html;charset=utf-8," + url.PathEscape(htmlDoc)
 	}
-	_, _, err := b.webDriverRequest(ctx, http.MethodPost, b.sessionPath("/url"), map[string]any{"url": targetURL})
+	_, _, err := b.sess.Do(ctx, http.MethodPost, b.sess.Path("/url"), map[string]any{"url": targetURL})
 	return err
-}
-
-func (b *webDriverBrowser) setCookies(ctx context.Context, rawURL string, cookies []Cookie) error {
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return err
-	}
-	domain := parsed.Hostname()
-	secure := strings.EqualFold(parsed.Scheme, "https")
-
-	for _, cookie := range cookies {
-		if cookie.Name == "" {
-			continue
-		}
-		payload := map[string]any{
-			"cookie": map[string]any{
-				"name":     cookie.Name,
-				"value":    cookie.Value,
-				"path":     firstCookiePath(cookie.Path),
-				"domain":   firstNonEmpty(cookie.Domain, domain),
-				"secure":   cookie.Secure || secure,
-				"httpOnly": cookie.HTTPOnly,
-			},
-		}
-		if strings.TrimSpace(cookie.SameSite) != "" {
-			payload["cookie"].(map[string]any)["sameSite"] = cookie.SameSite
-		}
-		if cookie.Expires > 0 {
-			payload["cookie"].(map[string]any)["expiry"] = int64(cookie.Expires)
-		}
-		if _, _, err := b.webDriverRequest(ctx, http.MethodPost, b.sessionPath("/cookie"), payload); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func (b *webDriverBrowser) solveChallenge(ctx context.Context) error {
@@ -907,7 +765,7 @@ func (b *webDriverBrowser) mouseWiggle(ctx context.Context) error {
 
 func (b *webDriverBrowser) resolveTurnstileToken(ctx context.Context, tabs int) (string, error) {
 	for _, selector := range turnstileSelectors {
-		exists, err := b.selectorExists(ctx, selector)
+		exists, err := b.sess.SelectorExists(ctx, selector)
 		if err != nil {
 			return "", err
 		}
@@ -1001,7 +859,7 @@ func (b *webDriverBrowser) runWebDriverKeySequence(ctx context.Context, tabs int
 func (b *webDriverBrowser) prepareWebDriverInput(ctx context.Context) error {
 	_, _ = b.executeCDP(ctx, "Page.bringToFront", map[string]any{})
 	_, _ = b.executeCDP(ctx, "Emulation.setFocusEmulationEnabled", map[string]any{"enabled": true})
-	_, _ = b.executeScript(ctx, `(() => {
+	_, _ = b.sess.Execute(ctx, `(() => {
 		try { window.focus(); } catch (_) {}
 		try {
 			if (document.body && typeof document.body.focus === 'function') {
@@ -1062,12 +920,12 @@ func (b *webDriverBrowser) clickTabbableChallengeTarget(ctx context.Context, tab
 func (b *webDriverBrowser) focusTarget(ctx context.Context, target clickTarget) error {
 	script := browserpkg.FocusTargetScript(target)
 
-	_, err := b.executeScript(ctx, script)
+	_, err := b.sess.Execute(ctx, script)
 	return err
 }
 
 func (b *webDriverBrowser) focusHelperButton(ctx context.Context) error {
-	_, err := b.executeScript(ctx, browserpkg.FocusHelperScript)
+	_, err := b.sess.Execute(ctx, browserpkg.FocusHelperScript)
 	return err
 }
 
@@ -1126,7 +984,7 @@ func (b *webDriverBrowser) clickVerifyHumanButton(ctx context.Context) (bool, er
 		};
 	})()`
 
-	raw, err := b.executeScript(ctx, script)
+	raw, err := b.sess.Execute(ctx, script)
 	if err != nil {
 		return false, err
 	}
@@ -1227,7 +1085,7 @@ func (b *webDriverBrowser) waitChallengeGone(ctx context.Context, d time.Duratio
 }
 
 func (b *webDriverBrowser) clickTargets(ctx context.Context) ([]clickTarget, error) {
-	raw, err := b.executeScript(ctx, browserpkg.ClickTargetsScript)
+	raw, err := b.sess.Execute(ctx, browserpkg.ClickTargetsScript)
 	if err != nil {
 		return nil, err
 	}
@@ -1243,8 +1101,8 @@ func (b *webDriverBrowser) clickTargets(ctx context.Context) ([]clickTarget, err
 }
 
 func (b *webDriverBrowser) debugChallengeState(ctx context.Context, stage string) {
-	activeElement, _ := b.executeString(ctx, browserpkg.ActiveElementScript)
-	hasFocus, _ := b.executeBool(ctx, browserpkg.HasFocusScript)
+	activeElement, _ := b.sess.ExecuteString(ctx, browserpkg.ActiveElementScript)
+	hasFocus, _ := b.sess.ExecuteBool(ctx, browserpkg.HasFocusScript)
 
 	targets, err := b.clickTargets(ctx)
 	if err != nil {
@@ -1260,7 +1118,7 @@ func (b *webDriverBrowser) debugChallengeState(ctx context.Context, stage string
 }
 
 func (b *webDriverBrowser) challengePresent(ctx context.Context) (bool, error) {
-	title, err := b.pageTitle(ctx)
+	title, err := b.sess.Title(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -1270,7 +1128,7 @@ func (b *webDriverBrowser) challengePresent(ctx context.Context) (bool, error) {
 		}
 	}
 	for _, selector := range challengeSelectors {
-		exists, err := b.selectorExists(ctx, selector)
+		exists, err := b.sess.SelectorExists(ctx, selector)
 		if err != nil {
 			return false, err
 		}
@@ -1281,92 +1139,11 @@ func (b *webDriverBrowser) challengePresent(ctx context.Context) (bool, error) {
 	return false, nil
 }
 
-func (b *webDriverBrowser) pageTitle(ctx context.Context) (string, error) {
-	raw, _, err := b.webDriverRequest(ctx, http.MethodGet, b.sessionPath("/title"), nil)
-	if err != nil {
-		return "", err
-	}
-	var title string
-	if err := json.Unmarshal(raw, &title); err != nil {
-		return "", err
-	}
-	return title, nil
-}
-
-func (b *webDriverBrowser) currentURL(ctx context.Context) (string, error) {
-	raw, _, err := b.webDriverRequest(ctx, http.MethodGet, b.sessionPath("/url"), nil)
-	if err != nil {
-		return "", err
-	}
-	var current string
-	if err := json.Unmarshal(raw, &current); err != nil {
-		return "", err
-	}
-	return current, nil
-}
-
-func (b *webDriverBrowser) pageHTML(ctx context.Context) (string, error) {
-	return b.executeString(ctx, `document.documentElement ? document.documentElement.outerHTML : ''`)
-}
-
-func (b *webDriverBrowser) selectorExists(ctx context.Context, selector string) (bool, error) {
-	return b.executeBool(ctx, fmt.Sprintf(`document.querySelector(%q) !== null`, selector))
-}
-
 func (b *webDriverBrowser) readInputValue(ctx context.Context, selector string) (string, error) {
-	return b.executeString(ctx, fmt.Sprintf(`(() => {
+	return b.sess.ExecuteString(ctx, fmt.Sprintf(`(() => {
 		const el = document.querySelector(%q);
 		return el ? (el.value || '') : '';
 	})()`, selector))
-}
-
-func (b *webDriverBrowser) currentCookies(ctx context.Context) ([]Cookie, error) {
-	raw, _, err := b.webDriverRequest(ctx, http.MethodGet, b.sessionPath("/cookie"), nil)
-	if err != nil {
-		return nil, err
-	}
-
-	type wdCookie struct {
-		Name     string  `json:"name"`
-		Value    string  `json:"value"`
-		Domain   string  `json:"domain"`
-		Path     string  `json:"path"`
-		HTTPOnly bool    `json:"httpOnly"`
-		Secure   bool    `json:"secure"`
-		SameSite string  `json:"sameSite"`
-		Expiry   float64 `json:"expiry"`
-	}
-	var entries []wdCookie
-	if err := json.Unmarshal(raw, &entries); err != nil {
-		return nil, err
-	}
-
-	result := make([]Cookie, 0, len(entries))
-	for _, entry := range entries {
-		result = append(result, Cookie{
-			Name:     entry.Name,
-			Value:    entry.Value,
-			Domain:   entry.Domain,
-			Path:     entry.Path,
-			HTTPOnly: entry.HTTPOnly,
-			Secure:   entry.Secure,
-			SameSite: entry.SameSite,
-			Expires:  entry.Expiry,
-		})
-	}
-	return result, nil
-}
-
-func (b *webDriverBrowser) screenshot(ctx context.Context) (string, error) {
-	raw, _, err := b.webDriverRequest(ctx, http.MethodGet, b.sessionPath("/screenshot"), nil)
-	if err != nil {
-		return "", err
-	}
-	var encoded string
-	if err := json.Unmarshal(raw, &encoded); err != nil {
-		return "", err
-	}
-	return encoded, nil
 }
 
 func (b *webDriverBrowser) userAgent(ctx context.Context) (string, error) {
@@ -1374,7 +1151,7 @@ func (b *webDriverBrowser) userAgent(ctx context.Context) (string, error) {
 		return b.cachedUserAgent, nil
 	}
 
-	ua, err := b.executeString(ctx, `navigator.userAgent`)
+	ua, err := b.sess.ExecuteString(ctx, `navigator.userAgent`)
 	if err != nil {
 		return "", err
 	}
@@ -1382,53 +1159,8 @@ func (b *webDriverBrowser) userAgent(ctx context.Context) (string, error) {
 	return b.cachedUserAgent, nil
 }
 
-func (b *webDriverBrowser) executeString(ctx context.Context, script string) (string, error) {
-	raw, err := b.executeScript(ctx, script)
-	if err != nil {
-		return "", err
-	}
-	var value string
-	if err := json.Unmarshal(raw, &value); err != nil {
-		return "", err
-	}
-	return value, nil
-}
-
-func (b *webDriverBrowser) executeBool(ctx context.Context, script string) (bool, error) {
-	raw, err := b.executeScript(ctx, script)
-	if err != nil {
-		return false, err
-	}
-	var value bool
-	if err := json.Unmarshal(raw, &value); err != nil {
-		return false, err
-	}
-	return value, nil
-}
-
-func (b *webDriverBrowser) executeScript(ctx context.Context, script string, args ...any) (json.RawMessage, error) {
-	if args == nil {
-		args = []any{}
-	}
-	script = wrapWebDriverExpression(script)
-	raw, _, err := b.webDriverRequest(ctx, http.MethodPost, b.sessionPath("/execute/sync"), map[string]any{
-		"script": script,
-		"args":   args,
-	})
-	return raw, err
-}
-
-func wrapWebDriverExpression(script string) string {
-	script = strings.TrimSpace(script)
-	script = strings.TrimSuffix(script, ";")
-	if script == "" {
-		return "return null"
-	}
-	return "return (" + script + ")"
-}
-
 func (b *webDriverBrowser) executeCDP(ctx context.Context, cmd string, params map[string]any) (json.RawMessage, error) {
-	raw, _, err := b.webDriverRequest(ctx, http.MethodPost, b.sessionPath("/goog/cdp/execute"), map[string]any{
+	raw, _, err := b.sess.Do(ctx, http.MethodPost, b.sess.Path("/goog/cdp/execute"), map[string]any{
 		"cmd":    cmd,
 		"params": params,
 	})
@@ -1436,67 +1168,22 @@ func (b *webDriverBrowser) executeCDP(ctx context.Context, cmd string, params ma
 }
 
 func (b *webDriverBrowser) performActions(ctx context.Context, actions []map[string]any) error {
-	_, _, err := b.webDriverRequest(ctx, http.MethodPost, b.sessionPath("/actions"), map[string]any{
+	_, _, err := b.sess.Do(ctx, http.MethodPost, b.sess.Path("/actions"), map[string]any{
 		"actions": actions,
 	})
 	return err
 }
 
 func (b *webDriverBrowser) releaseActions(ctx context.Context) error {
-	_, _, err := b.webDriverRequest(ctx, http.MethodDelete, b.sessionPath("/actions"), nil)
+	_, _, err := b.sess.Do(ctx, http.MethodDelete, b.sess.Path("/actions"), nil)
 	return err
-}
-
-func (b *webDriverBrowser) sessionPath(path string) string {
-	return "/session/" + b.sessionID + path
 }
 
 func (b *webDriverBrowser) switchToDefaultContent(ctx context.Context) error {
-	_, _, err := b.webDriverRequest(ctx, http.MethodPost, b.sessionPath("/frame"), map[string]any{
+	_, _, err := b.sess.Do(ctx, http.MethodPost, b.sess.Path("/frame"), map[string]any{
 		"id": nil,
 	})
 	return err
-}
-
-func (b *webDriverBrowser) driverLogTail() string {
-	if strings.TrimSpace(b.driverLogPath) == "" {
-		return ""
-	}
-	file, err := os.Open(b.driverLogPath)
-	if err != nil {
-		return ""
-	}
-	defer file.Close()
-
-	info, err := file.Stat()
-	if err != nil || info.Size() == 0 {
-		return ""
-	}
-
-	const maxTailBytes = 64 * 1024
-	start := int64(0)
-	if info.Size() > maxTailBytes {
-		start = info.Size() - maxTailBytes
-	}
-	if _, err := file.Seek(start, io.SeekStart); err != nil {
-		return ""
-	}
-
-	data, err := io.ReadAll(file)
-	if err != nil || len(data) == 0 {
-		return ""
-	}
-	if start > 0 {
-		if cut := bytes.IndexByte(data, '\n'); cut >= 0 && cut+1 < len(data) {
-			data = data[cut+1:]
-		}
-	}
-	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-	lineStart := 0
-	if len(lines) > 12 {
-		lineStart = len(lines) - 12
-	}
-	return strings.Join(lines[lineStart:], " | ")
 }
 
 func (b *webDriverBrowser) documentResponse(ctx context.Context, currentURL string) (documentResponse, error) {
@@ -1564,7 +1251,7 @@ func (b *webDriverBrowser) performanceLog(ctx context.Context) ([]json.RawMessag
 
 	var lastErr error
 	for _, path := range paths {
-		raw, _, err := b.webDriverRequest(ctx, http.MethodPost, path, map[string]any{"type": "performance"})
+		raw, _, err := b.sess.Do(ctx, http.MethodPost, path, map[string]any{"type": "performance"})
 		if err != nil {
 			lastErr = err
 			continue
@@ -1586,8 +1273,8 @@ func (b *webDriverBrowser) performanceLog(ctx context.Context) ([]json.RawMessag
 
 func (b *webDriverBrowser) performanceLogPaths() []string {
 	defaults := []string{
-		b.sessionPath("/se/log"),
-		b.sessionPath("/log"),
+		b.sess.Path("/se/log"),
+		b.sess.Path("/log"),
 	}
 	if strings.TrimSpace(b.perfLogPath) == "" {
 		return defaults
@@ -1603,69 +1290,7 @@ func (b *webDriverBrowser) performanceLogPaths() []string {
 	return paths
 }
 
-func (b *webDriverBrowser) webDriverRequest(ctx context.Context, method, path string, payload any) (json.RawMessage, string, error) {
-	var body io.Reader
-	if payload != nil {
-		data, err := json.Marshal(payload)
-		if err != nil {
-			return nil, "", err
-		}
-		body = bytes.NewReader(data)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, method, b.baseURL+path, body)
-	if err != nil {
-		return nil, "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := b.httpClient.Do(req)
-	if err != nil {
-		return nil, "", err
-	}
-	defer resp.Body.Close()
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, "", err
-	}
-
-	var envelope struct {
-		Value     json.RawMessage `json:"value"`
-		SessionID string          `json:"sessionId"`
-	}
-	if len(data) > 0 {
-		if err := json.Unmarshal(data, &envelope); err != nil {
-			if resp.StatusCode >= 400 {
-				return nil, "", fmt.Errorf("webdriver http %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
-			}
-			return nil, "", err
-		}
-	}
-
-	if resp.StatusCode >= 400 {
-		var wdErr struct {
-			Error   string `json:"error"`
-			Message string `json:"message"`
-		}
-		if len(envelope.Value) > 0 && json.Unmarshal(envelope.Value, &wdErr) == nil && strings.TrimSpace(wdErr.Message) != "" {
-			return nil, envelope.SessionID, fmt.Errorf("%s", wdErr.Message)
-		}
-		return nil, envelope.SessionID, fmt.Errorf("webdriver http %d", resp.StatusCode)
-	}
-
-	return envelope.Value, envelope.SessionID, nil
-}
-
-func (b *webDriverBrowser) deleteSession(ctx context.Context) {
-	if strings.TrimSpace(b.sessionID) == "" || strings.TrimSpace(b.baseURL) == "" {
-		return
-	}
-	_, _, _ = b.webDriverRequest(ctx, http.MethodDelete, b.sessionPath(""), nil)
-	b.sessionID = ""
-}
-
-func (b *webDriverBrowser) prepareHeadlessMode() (bool, string, error) {
+func (b *webDriverBrowser) prepareHeadlessMode(ctx context.Context) (bool, string, error) {
 	if !b.cfg.Headless || runtime.GOOS == "windows" {
 		return b.cfg.Headless, "", nil
 	}
@@ -1677,15 +1302,15 @@ func (b *webDriverBrowser) prepareHeadlessMode() (bool, string, error) {
 		b.logger.Warn("HEADLESS=true without DISPLAY or Xvfb; falling back to Chrome headless mode")
 		return true, "", nil
 	}
-	display, err := b.startDisplay(xvfbPath)
+	display, err := b.startDisplay(ctx, xvfbPath)
 	if err != nil {
 		return false, "", err
 	}
 	return false, display, nil
 }
 
-func (b *webDriverBrowser) startDisplay(xvfbPath string) (string, error) {
-	proc, display, err := browserpkg.StartXvfb(xvfbPath)
+func (b *webDriverBrowser) startDisplay(ctx context.Context, xvfbPath string) (string, error) {
+	proc, display, err := browserpkg.StartXvfb(ctx, xvfbPath)
 	if err != nil {
 		return "", err
 	}
@@ -1859,15 +1484,6 @@ func writeProxyExtensionFile(path string, content []byte) error {
 		return err
 	}
 	return nil
-}
-
-func freeLocalPort() (int, error) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, err
-	}
-	defer listener.Close()
-	return listener.Addr().(*net.TCPAddr).Port, nil
 }
 
 func splitChromeArgs(raw string) []string {

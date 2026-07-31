@@ -1,6 +1,7 @@
 package flaresolverr
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -12,7 +13,7 @@ import (
 
 type defaultBrowserFactory struct{}
 
-func (defaultBrowserFactory) New(cfg Config, proxy *Proxy) (browserClient, error) {
+func (defaultBrowserFactory) New(ctx context.Context, cfg Config, proxy *Proxy) (browserClient, error) {
 	cfg = cfg.withDefaults()
 	browserCfg := browserpkg.Config{
 		BrowserPath:         cfg.BrowserPath,
@@ -33,9 +34,9 @@ func (defaultBrowserFactory) New(cfg Config, proxy *Proxy) (browserClient, error
 
 	switch backend {
 	case "geckodriver":
-		return newGeckoDriverBackend(cfg, browserCfg, proxy)
+		return newGeckoDriverBackend(ctx, cfg, browserCfg, proxy)
 	case "chromedriver":
-		return newChromeDriverBackend(cfg, browserCfg, proxy)
+		return newChromeDriverBackend(ctx, cfg, browserCfg, proxy)
 	}
 	return nil, fmt.Errorf("unknown browser backend %q", backend)
 }
@@ -59,7 +60,7 @@ func resolveBrowserBackend(cfg Config) string {
 	return "chromedriver"
 }
 
-func newGeckoDriverBackend(cfg Config, browserCfg browserpkg.Config, proxy *Proxy) (browserClient, error) {
+func newGeckoDriverBackend(ctx context.Context, cfg Config, browserCfg browserpkg.Config, proxy *Proxy) (browserClient, error) {
 	if strings.TrimSpace(browserCfg.BrowserPath) == "" {
 		if detected := findFirefoxBinary(); detected != "" {
 			browserCfg.BrowserPath = detected
@@ -82,20 +83,20 @@ func newGeckoDriverBackend(cfg Config, browserCfg browserpkg.Config, proxy *Prox
 	if strings.TrimSpace(browserCfg.BrowserPath) == "" {
 		return nil, fmt.Errorf("firefox/camoufox binary not found; set browser_path or install camoufox")
 	}
-	return geckodriverbackend.NewGeckoDriver(browserCfg, proxy)
+	return geckodriverbackend.NewGeckoDriver(ctx, browserCfg, proxy)
 }
 
-func newChromeDriverBackend(cfg Config, browserCfg browserpkg.Config, proxy *Proxy) (browserClient, error) {
+func newChromeDriverBackend(ctx context.Context, cfg Config, browserCfg browserpkg.Config, proxy *Proxy) (browserClient, error) {
 	driverPath, err := resolveChromeDriverPath(cfg)
 	if err != nil {
 		cfg.Logger.Warn("webdriver backend unavailable; falling back to chromedp backend", "err", err)
-		return chromedpbackend.NewChromedp(browserCfg, proxy)
+		return chromedpbackend.NewChromedp(ctx, browserCfg, proxy)
 	}
 	if driverPath != "" {
 		browserCfg.DriverPath = driverPath
 		cfg.Logger.Info("using webdriver backend with patched chromedriver", "driver_path", browserCfg.DriverPath)
-		return webdriverbackend.NewWebDriver(browserCfg, proxy)
+		return webdriverbackend.NewWebDriver(ctx, browserCfg, proxy)
 	}
 	cfg.Logger.Warn("chromedriver not found; falling back to chromedp backend")
-	return chromedpbackend.NewChromedp(browserCfg, proxy)
+	return chromedpbackend.NewChromedp(ctx, browserCfg, proxy)
 }

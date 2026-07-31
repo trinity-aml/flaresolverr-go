@@ -139,7 +139,7 @@ func (s *Service) cmdSessionsCreate(ctx context.Context, req *V1Request) (V1Resp
 	if proxy == nil {
 		proxy = cfg.DefaultProxy
 	}
-	item, fresh, err := s.sessions.create(req.Session, proxy, false)
+	item, fresh, err := s.sessions.create(ctx, req.Session, proxy, false)
 	if err != nil {
 		return V1Response{}, err
 	}
@@ -223,7 +223,7 @@ func (s *Service) resolveChallenge(ctx context.Context, req *V1Request, method s
 
 	if req.Session != "" {
 		ttl := time.Duration(req.SessionTTLMinutes) * time.Minute
-		item, _, err = s.sessions.get(req.Session, ttl)
+		item, _, err = s.sessions.get(ctx, req.Session, ttl)
 		if err != nil {
 			return nil, "", err
 		}
@@ -233,7 +233,7 @@ func (s *Service) resolveChallenge(ctx context.Context, req *V1Request, method s
 		if proxy == nil {
 			proxy = cfg.DefaultProxy
 		}
-		client, err = s.factory.New(cfg, proxy)
+		client, err = s.factory.New(ctx, cfg, proxy)
 		if err != nil {
 			return nil, "", fmt.Errorf("create ephemeral browser: %w", err)
 		}

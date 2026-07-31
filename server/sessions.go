@@ -1,6 +1,7 @@
 package flaresolverr
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sort"
@@ -15,7 +16,7 @@ type browserResult = browserpkg.Result
 type browserClient = browserpkg.Client
 
 type browserFactory interface {
-	New(Config, *Proxy) (browserClient, error)
+	New(context.Context, Config, *Proxy) (browserClient, error)
 }
 
 // errSessionClosed is returned when a session is destroyed between the lookup
@@ -91,7 +92,7 @@ func newSessionStore(cfg Config, factory browserFactory, userAgentFn func() stri
 // store. Instead the map entry is reserved first, the lock released, and the
 // browser built outside it; concurrent callers for the same id block on
 // item.ready rather than on the store.
-func (s *sessionStore) create(sessionID string, proxy *Proxy, forceNew bool) (*session, bool, error) {
+func (s *sessionStore) create(ctx context.Context, sessionID string, proxy *Proxy, forceNew bool) (*session, bool, error) {
 	s.mu.Lock()
 
 	if sessionID == "" {
@@ -130,7 +131,7 @@ func (s *sessionStore) create(sessionID string, proxy *Proxy, forceNew bool) (*s
 		cfg.StartupUserAgent = userAgentFn()
 	}
 
-	browser, err := s.factory.New(cfg, proxy)
+	browser, err := s.factory.New(ctx, cfg, proxy)
 	item.browser = browser
 	if err != nil {
 		item.err = fmt.Errorf("create browser session: %w", err)
@@ -160,15 +161,15 @@ func (s *sessionStore) create(sessionID string, proxy *Proxy, forceNew bool) (*s
 	return item, true, nil
 }
 
-func (s *sessionStore) get(sessionID string, ttl time.Duration) (*session, bool, error) {
-	item, fresh, err := s.create(sessionID, nil, false)
+func (s *sessionStore) get(ctx context.Context, sessionID string, ttl time.Duration) (*session, bool, error) {
+	item, fresh, err := s.create(ctx, sessionID, nil, false)
 	if err != nil {
 		return nil, false, err
 	}
 	if ttl <= 0 || fresh || item.lifetime() <= ttl {
 		return item, fresh, nil
 	}
-	return s.create(sessionID, nil, true)
+	return s.create(ctx, sessionID, nil, true)
 }
 
 func (s *sessionStore) applyConfig(cfg Config) {

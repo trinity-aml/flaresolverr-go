@@ -47,7 +47,7 @@ type fakeFactory struct {
 	maxSeen  atomic.Int32
 }
 
-func (f *fakeFactory) New(Config, *Proxy) (browserClient, error) {
+func (f *fakeFactory) New(ctx context.Context, _ Config, _ *Proxy) (browserClient, error) {
 	n := f.inFlight.Add(1)
 	for {
 		seen := f.maxSeen.Load()
@@ -58,7 +58,11 @@ func (f *fakeFactory) New(Config, *Proxy) (browserClient, error) {
 	defer f.inFlight.Add(-1)
 
 	if f.delay > 0 {
-		time.Sleep(f.delay)
+		select {
+		case <-time.After(f.delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 	if f.err != nil {
 		return nil, f.err
@@ -85,7 +89,7 @@ func TestSessionStoreCreateAndReuse(t *testing.T) {
 	factory := &fakeFactory{}
 	store := newTestStore(factory)
 
-	first, fresh, err := store.create("s1", nil, false)
+	first, fresh, err := store.create(context.Background(), "s1", nil, false)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -93,7 +97,7 @@ func TestSessionStoreCreateAndReuse(t *testing.T) {
 		t.Error("the first create must report a fresh session")
 	}
 
-	second, fresh, err := store.create("s1", nil, false)
+	second, fresh, err := store.create(context.Background(), "s1", nil, false)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -112,10 +116,10 @@ func TestSessionStoreForceNewClosesTheOldBrowser(t *testing.T) {
 	factory := &fakeFactory{}
 	store := newTestStore(factory)
 
-	if _, _, err := store.create("s1", nil, false); err != nil {
+	if _, _, err := store.create(context.Background(), "s1", nil, false); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if _, _, err := store.create("s1", nil, true); err != nil {
+	if _, _, err := store.create(context.Background(), "s1", nil, true); err != nil {
 		t.Fatalf("forced create: %v", err)
 	}
 
@@ -135,7 +139,7 @@ func TestSessionStoreCreateFailureLeavesNoEntry(t *testing.T) {
 	factory := &fakeFactory{err: errors.New("boom")}
 	store := newTestStore(factory)
 
-	if _, _, err := store.create("s1", nil, false); err == nil {
+	if _, _, err := store.create(context.Background(), "s1", nil, false); err == nil {
 		t.Fatal("expected create to fail")
 	}
 	if ids := store.ids(); len(ids) != 0 {
@@ -144,7 +148,7 @@ func TestSessionStoreCreateFailureLeavesNoEntry(t *testing.T) {
 
 	// A later successful create for the same id must still work.
 	factory.err = nil
-	if _, fresh, err := store.create("s1", nil, false); err != nil || !fresh {
+	if _, fresh, err := store.create(context.Background(), "s1", nil, false); err != nil || !fresh {
 		t.Errorf("retry after failure: fresh=%v err=%v", fresh, err)
 	}
 }
@@ -158,7 +162,7 @@ func TestSessionStoreCreateDoesNotBlockOtherOperations(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		if _, _, err := store.create("slow", nil, false); err != nil {
+		if _, _, err := store.create(context.Background(), "slow", nil, false); err != nil {
 			t.Errorf("create: %v", err)
 		}
 	}()
@@ -190,7 +194,7 @@ func TestSessionStoreConcurrentCreatesRunInParallel(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			id := string(rune('a' + i))
-			if _, _, err := store.create(id, nil, false); err != nil {
+			if _, _, err := store.create(context.Background(), id, nil, false); err != nil {
 				t.Errorf("create %s: %v", id, err)
 			}
 		}()
@@ -212,7 +216,7 @@ func TestSessionStoreConcurrentCreatesSameIDBuildOneBrowser(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, _, err := store.create("same", nil, false); err != nil {
+			if _, _, err := store.create(context.Background(), "same", nil, false); err != nil {
 				t.Errorf("create: %v", err)
 			}
 		}()
@@ -232,7 +236,7 @@ func TestSessionStoreDestroyDuringCreationClosesTheBrowser(t *testing.T) {
 
 	go func() {
 		// Ignore the error: losing the race is the expected outcome here.
-		_, _, _ = store.create("racy", nil, false)
+		_, _, _ = store.create(context.Background(), "racy", nil, false)
 	}()
 
 	time.Sleep(50 * time.Millisecond)
@@ -255,7 +259,7 @@ func TestSessionStoreDestroyIsIdempotentAndClosesOnce(t *testing.T) {
 	factory := &fakeFactory{}
 	store := newTestStore(factory)
 
-	if _, _, err := store.create("s1", nil, false); err != nil {
+	if _, _, err := store.create(context.Background(), "s1", nil, false); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 
@@ -277,7 +281,7 @@ func TestSessionStoreConcurrentDestroyAndUse(t *testing.T) {
 	factory := &fakeFactory{}
 	store := newTestStore(factory)
 
-	item, _, err := store.create("s1", nil, false)
+	item, _, err := store.create(context.Background(), "s1", nil, false)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -309,7 +313,7 @@ func TestSessionStoreGetRecreatesAfterTTL(t *testing.T) {
 	factory := &fakeFactory{}
 	store := newTestStore(factory)
 
-	first, _, err := store.get("s1", time.Hour)
+	first, _, err := store.get(context.Background(), "s1", time.Hour)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -317,7 +321,7 @@ func TestSessionStoreGetRecreatesAfterTTL(t *testing.T) {
 	// Backdate the session past the TTL.
 	first.createdAt = time.Now().Add(-2 * time.Hour)
 
-	second, _, err := store.get("s1", time.Hour)
+	second, _, err := store.get(context.Background(), "s1", time.Hour)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -333,13 +337,13 @@ func TestSessionStoreGetWithoutTTLKeepsSession(t *testing.T) {
 	factory := &fakeFactory{}
 	store := newTestStore(factory)
 
-	first, _, err := store.get("s1", 0)
+	first, _, err := store.get(context.Background(), "s1", 0)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
 	first.createdAt = time.Now().Add(-100 * time.Hour)
 
-	second, _, err := store.get("s1", 0)
+	second, _, err := store.get(context.Background(), "s1", 0)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -353,7 +357,7 @@ func TestSessionStoreIDsAreSorted(t *testing.T) {
 	store := newTestStore(factory)
 
 	for _, id := range []string{"c", "a", "b"} {
-		if _, _, err := store.create(id, nil, false); err != nil {
+		if _, _, err := store.create(context.Background(), id, nil, false); err != nil {
 			t.Fatalf("create %s: %v", id, err)
 		}
 	}
@@ -368,7 +372,7 @@ func TestSessionStoreCreateGeneratesID(t *testing.T) {
 	factory := &fakeFactory{}
 	store := newTestStore(factory)
 
-	item, _, err := store.create("", nil, false)
+	item, _, err := store.create(context.Background(), "", nil, false)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -382,7 +386,7 @@ func TestSessionStoreDestroyAllClosesEverything(t *testing.T) {
 	store := newTestStore(factory)
 
 	for _, id := range []string{"a", "b", "c"} {
-		if _, _, err := store.create(id, nil, false); err != nil {
+		if _, _, err := store.create(context.Background(), id, nil, false); err != nil {
 			t.Fatalf("create %s: %v", id, err)
 		}
 	}
