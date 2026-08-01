@@ -6,6 +6,52 @@
 
 ### Исправлено
 
+- **Бэкенд `chromedriver` не решал ни одного интерактивного Turnstile.** Chrome убрал
+  `--enable-blink-features=FakeShadowRoot`: замерено на Chrome 151 — если навесить на свежий
+  элемент closed shadow root и прочитать `.fakeShadowRoot` с переданным флагом, получается
+  `undefined`. Все обходчики в `scripts.go` ходят через `el.fakeShadowRoot || el.shadowRoot`, так
+  что виджет Cloudflare становился невидим полностью: `clickTargets` возвращал `[]`,
+  `solveChallenge` трижды не находил управляющих элементов и падал с диагнозом
+  «browser fingerprint likely blocked» — неверным в каждом случае. Оказалось, chromedriver, как и
+  Marionette, отдаёт closed shadow root через W3C-эндпоинт `GET /element/{id}/shadow`, поэтому
+  чинится уже написанным кодом: обход вынесен в общий `w3c.FindThroughShadowDOM`, geckodriver
+  перешёл на него (минус 47 строк приватных копий), а `clickTargets` в webdriver-бэкенде
+  дописывает найденный так iframe к результатам page-side обхода. Обход включается только когда
+  челлендж действительно на экране — он стоит один round-trip на элемент, и на настоящей странице
+  выжигал весь лимит в 400 узлов впустую.
+- **Бэкенд `chromedp` тоже не решал интерактивные Turnstile** — по той же причине, но WebDriver-
+  сессии у него нет вовсе, так что эндпоинт shadow root недоступен. Виджет ищется через CDP
+  `DOM.getDocument` с `pierce: true` (обход обязан следовать `Children`, `ShadowRoots` **и**
+  `ContentDocument` — в pierced-дереве shadow root и документ iframe висят на отдельных полях) и
+  `DOM.getBoxModel` для прямоугольника. Это важнее, чем кажется: chromedp — автоматический фолбэк
+  везде, где не нашёлся chromedriver, то есть на типовой инсталляции. Замерено: 4 прогона из 4,
+  11.1–12.1 с — быстрее обоих драйверных бэкендов, у которых на каждый узел уходит round-trip.
+- **Ладдер кликал ссылку «Cloudflare» в футере вместо чекбокса.** Клик по challenge-iframe стоял
+  в `clickVerify` **последним**, что было безобидно ровно до тех пор, пока виджет вообще не
+  находился. Как только он стал находиться, порядок начал вредить:
+  `clickTabbableChallengeTarget` берёт первый tabbable-элемент страницы, а на голом интерстишиале
+  это ссылка на cloudflare.com. Шаги переставлены от частного к общему, ладдер останавливается,
+  как только челлендж исчез, а клавиатурная последовательность ушла в конец. Замерено:
+  4 прогона из 4 закрываются шагом `challenge iframe`, ноль обращений к футерным ссылкам,
+  время упало с 20–22 с до 14.7–15.6 с — вровень с geckodriver.
+
+- **Бэкенд `geckodriver` не запускался на машине, где установлен и Chrome, и Firefox/camoufox.**
+  `defaultConfigValues()` безусловно подставлял `findChromeBinary()` в `BrowserPath`, поэтому
+  geckodriver получал путь к **Chrome** и отвергал его: `binary is not a Firefox executable`.
+  Автоопределение camoufox в `newGeckoDriverBackend` при этом не срабатывало никогда — оно
+  включается, только если путь пуст, а пустым он уже не был. Теперь `BrowserPath` по умолчанию
+  пуст, и каждый бэкенд ищет свой браузер сам (`newChromeDriverBackend` получил симметричный блок
+  определения Chrome). Побочный эффект: `/api/settings` показывает `browserPath: ""` вместо
+  автоопределённого пути к Chrome — это соответствует `init.yaml` и означает «не задано,
+  определять автоматически».
+- **`findFirefoxBinary` выбирал обёртку вместо настоящего браузера и игнорировал установленный
+  camoufox.** Порядок поиска был «PATH camoufox → PATH firefox → `~/.cache/camoufox`», из-за чего
+  распакованный camoufox проигрывал стоковому firefox, хотя комментарий обещал обратное. Вдобавок
+  `/usr/bin/firefox` на snap- и flatpak-сборках — shell-скрипт, который geckodriver отвергает.
+  Теперь camoufox проверяется во всех местах раньше любого Firefox, а кандидат сверяется по
+  `application.ini`/`platform.ini` рядом с бинарником (та же проверка, что делает сам geckodriver),
+  с фолбэком на известные пути вроде `/usr/lib/firefox/firefox`. Покрыто тестами
+  `server/browser_path_test.go`.
 - **`request.post` на chromedp-бэкенде отправлял двойное URL-кодирование.** Приватная копия
   `buildPostFormHTML` в `server/browser/chromedp` применяла `url.QueryEscape` поверх
   `html.EscapeString`, из-за чего значение `P@ss` приходило на сервер как `P%2540ss` — молча ломая

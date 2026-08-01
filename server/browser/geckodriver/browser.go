@@ -670,14 +670,6 @@ func (b *geckoBrowser) userAgent(ctx context.Context) (string, error) {
 // Turnstile widget from.
 const challengeFrameSelector = `iframe[src*="challenges.cloudflare.com"]`
 
-const (
-	// Each candidate node costs one round-trip to the driver, so the shadow
-	// walk is bounded. A challenge interstitial is a few dozen elements; the
-	// cap only bites if we somehow run it against a full-size page.
-	shadowWalkMaxNodes = 400
-	shadowWalkMaxDepth = 6
-)
-
 // clickTurnstileCheckbox locates the "verify you are human" checkbox and clicks
 // it natively. Returns whether the click was accepted, plus a diagnostic string.
 //
@@ -689,7 +681,7 @@ const (
 // missed, a widget that could not be seen. The WebDriver element endpoints do
 // see it, because Firefox hands over closed shadow roots (see w3c.ShadowRoot).
 func (b *geckoBrowser) clickTurnstileCheckbox(ctx context.Context) (bool, string) {
-	frame, walked, err := b.findThroughShadowDOM(ctx, challengeFrameSelector)
+	frame, walked, err := b.sess.FindThroughShadowDOM(ctx, challengeFrameSelector)
 	if err != nil {
 		return false, fmt.Sprintf("locating the challenge frame failed after %d nodes: %v", walked, err)
 	}
@@ -708,7 +700,7 @@ func (b *geckoBrowser) clickTurnstileCheckbox(ctx context.Context) (bool, string
 		}
 	}()
 
-	checkbox, walked, err := b.findThroughShadowDOM(ctx, "input[type=checkbox]")
+	checkbox, walked, err := b.sess.FindThroughShadowDOM(ctx, "input[type=checkbox]")
 	if err != nil {
 		return false, fmt.Sprintf("locating the checkbox failed after %d nodes: %v", walked, err)
 	}
@@ -730,61 +722,6 @@ func (b *geckoBrowser) clickTurnstileCheckbox(ctx context.Context) (bool, string
 		return true, "clicked, widget replaced (" + err.Error() + ")"
 	}
 	return selected, fmt.Sprintf("clicked, checked=%t", selected)
-}
-
-// findThroughShadowDOM returns a reference to the first element matching
-// selector in the current browsing context, descending into shadow roots when
-// the light DOM has no match. It also reports how many nodes it probed, which
-// is the number that tells "found nothing" apart from "gave up".
-//
-// The walk is breadth-first and deliberately unfiltered: a closed shadow host
-// is indistinguishable from an ordinary element until the driver is asked, so
-// every node is a candidate and the cost is capped instead of guessed at.
-func (b *geckoBrowser) findThroughShadowDOM(ctx context.Context, selector string) (string, int, error) {
-	ids, err := b.sess.FindElements(ctx, selector)
-	if err != nil {
-		return "", 0, err
-	}
-	if len(ids) > 0 {
-		return ids[0], 0, nil
-	}
-
-	walked := 0
-	roots := []string{""} // "" is the document itself
-	for depth := 0; depth < shadowWalkMaxDepth && len(roots) > 0; depth++ {
-		var deeper []string
-		for _, root := range roots {
-			hosts, err := b.findAllIn(ctx, root, "*")
-			if err != nil {
-				continue
-			}
-			for _, host := range hosts {
-				if walked >= shadowWalkMaxNodes {
-					return "", walked, fmt.Errorf("shadow walk hit its %d-node cap", shadowWalkMaxNodes)
-				}
-				walked++
-
-				shadow, err := b.sess.ShadowRoot(ctx, host)
-				if err != nil || shadow == "" {
-					continue
-				}
-				if found, err := b.sess.FindElementsInShadow(ctx, shadow, selector); err == nil && len(found) > 0 {
-					return found[0], walked, nil
-				}
-				deeper = append(deeper, shadow)
-			}
-		}
-		roots = deeper
-	}
-	return "", walked, nil
-}
-
-// findAllIn searches a shadow root, or the document when root is "".
-func (b *geckoBrowser) findAllIn(ctx context.Context, root, selector string) ([]string, error) {
-	if root == "" {
-		return b.sess.FindElements(ctx, selector)
-	}
-	return b.sess.FindElementsInShadow(ctx, root, selector)
 }
 
 // readTurnstileToken returns the value of any cf-turnstile-response input on

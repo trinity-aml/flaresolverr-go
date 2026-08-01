@@ -132,10 +132,16 @@ func (c Config) withDefaults() Config {
 
 func defaultConfigValues() Config {
 	return Config{
-		Host:                "0.0.0.0",
-		Port:                8191,
-		BrowserBackend:      "auto",
-		BrowserPath:         findChromeBinary(),
+		Host:           "0.0.0.0",
+		Port:           8191,
+		BrowserBackend: "auto",
+		// Deliberately empty: which browser to look for depends on the backend,
+		// and only the backend knows that. Defaulting to findChromeBinary() here
+		// meant geckodriver was handed Chrome's path on any machine that had
+		// both, and refused it with "binary is not a Firefox executable" — while
+		// the camoufox detection in newGeckoDriverBackend never ran, because the
+		// path it guards on was no longer empty.
+		BrowserPath:         "",
 		DriverAutoDownload:  true,
 		ChromeForTestingURL: defaultChromeForTestingBaseURL,
 		Headless:            true,

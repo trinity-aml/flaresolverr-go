@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +16,8 @@ import (
 	browserpkg "github.com/trinity-aml/flaresolverr-go/server/browser"
 	"github.com/trinity-aml/flaresolverr-go/server/browser/cdpauth"
 
+	"github.com/chromedp/cdproto/cdp"
+	"github.com/chromedp/cdproto/dom"
 	"github.com/chromedp/cdproto/emulation"
 	"github.com/chromedp/cdproto/input"
 	"github.com/chromedp/cdproto/network"
@@ -765,46 +768,45 @@ func (b *chromedpBrowser) resolveTurnstileToken(ctx context.Context, tabs int) (
 func (b *chromedpBrowser) clickVerify(ctx context.Context, tabs int) error {
 	b.debugChallengeState(ctx, "before-click-verify")
 
+	// Most specific first, stopping the moment the challenge clears. The iframe
+	// step used to be last, which was harmless only while the widget could never
+	// be found: clickTabbableChallengeTarget takes the first tabbable element on
+	// the page, and on a bare interstitial that is the "Cloudflare" footer link.
+	// Same ordering as the webdriver backend — keep them in step.
+	steps := []struct {
+		name string
+		wait time.Duration
+		run  func(context.Context) (bool, error)
+	}{
+		{"challenge iframe", 3 * time.Second, b.clickChallengeIframes},
+		{"verify buttons", 2 * time.Second, b.clickVerifyButtons},
+		{"tabbable target", 2 * time.Second, func(ctx context.Context) (bool, error) {
+			return b.clickTabbableChallengeTarget(ctx, tabs)
+		}},
+	}
+
+	for _, step := range steps {
+		clicked, err := step.run(ctx)
+		if err != nil {
+			b.logger.Debug("challenge click step failed", "step", step.name, "err", err)
+		}
+		if !clicked {
+			continue
+		}
+		if cleared, err := b.waitChallengeClear(ctx, step.wait); err == nil && cleared {
+			b.logger.Debug("challenge cleared", "step", step.name)
+			b.debugChallengeState(ctx, "after-click-verify")
+			return nil
+		}
+	}
+
+	// Key sequence last: Tab-then-Space aims at whatever happens to be focusable
+	// rather than at the widget.
 	if err := b.runWebDriverKeySequence(ctx, tabs); err != nil {
 		b.logger.Debug("cloudflare verify key sequence failed", "err", err)
 	}
-
-	cleared, err := b.waitChallengeClear(ctx, 1500*time.Millisecond)
-	if err == nil && cleared {
+	if cleared, err := b.waitChallengeClear(ctx, 1500*time.Millisecond); err == nil && cleared {
 		return nil
-	}
-
-	fallbackClicked, err := b.clickTabbableChallengeTarget(ctx, tabs)
-	if err != nil {
-		b.logger.Debug("webdriver tabbable target fallback failed", "err", err)
-	}
-	if fallbackClicked {
-		cleared, err = b.waitChallengeClear(ctx, 2*time.Second)
-		if err == nil && cleared {
-			return nil
-		}
-	}
-
-	buttonClicked, err := b.clickVerifyButtons(ctx)
-	if err != nil {
-		b.logger.Debug("cloudflare verify button click failed", "err", err)
-	}
-	if buttonClicked {
-		cleared, err = b.waitChallengeClear(ctx, 2*time.Second)
-		if err == nil && cleared {
-			return nil
-		}
-	}
-
-	iframeClicked, err := b.clickChallengeIframes(ctx)
-	if err != nil {
-		b.logger.Debug("cloudflare challenge iframe click failed", "err", err)
-	}
-	if iframeClicked {
-		cleared, err = b.waitChallengeClear(ctx, 3*time.Second)
-		if err == nil && cleared {
-			return nil
-		}
 	}
 
 	b.debugChallengeState(ctx, "after-click-verify")
@@ -1004,6 +1006,9 @@ func (b *chromedpBrowser) waitChallengeGone(ctx context.Context, d time.Duration
 	}
 }
 
+// challengeFrameHost is the origin Cloudflare serves the Turnstile widget from.
+const challengeFrameHost = "challenges.cloudflare.com"
+
 func (b *chromedpBrowser) clickTargets(ctx context.Context) ([]clickTarget, error) {
 	var targets []clickTarget
 	const script = browserpkg.ClickTargetsScript
@@ -1011,7 +1016,118 @@ func (b *chromedpBrowser) clickTargets(ctx context.Context) ([]clickTarget, erro
 	if err := chromedp.Run(ctx, chromedp.Evaluate(script, &targets)); err != nil {
 		return nil, err
 	}
+
+	// The page-side walk cannot see a Turnstile widget: Cloudflare hides it in a
+	// *closed* shadow root, and --enable-blink-features=FakeShadowRoot no longer
+	// exposes one (see w3c.ShadowRoot). The driver-based backends ask the driver;
+	// this one has no driver, so it asks CDP, which pierces closed roots.
+	//
+	// Gated on a challenge being on screen: piercing returns the whole document,
+	// and doing that on a real page is pure waste.
+	if !slices.ContainsFunc(targets, browserpkg.IsChallengeIframeTarget) {
+		if present, err := b.challengePresent(ctx); err == nil && present {
+			if frame, ok := b.challengeFrameTarget(ctx); ok {
+				targets = append(targets, frame)
+			}
+		}
+	}
 	return targets, nil
+}
+
+// challengeFrameTarget finds the Turnstile iframe through CDP and describes it
+// the way the page-side walker would have.
+//
+// Every failure is silent and reported as "not found": this runs on pages that
+// legitimately carry no widget, and a passive challenge must stay a passive
+// challenge rather than becoming an error.
+func (b *chromedpBrowser) challengeFrameTarget(ctx context.Context) (clickTarget, bool) {
+	var target clickTarget
+	found := false
+
+	err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		// pierce is the whole point: without it the closed shadow root hosting
+		// the widget is simply absent from the returned tree.
+		root, err := dom.GetDocument().WithDepth(-1).WithPierce(true).Do(ctx)
+		if err != nil {
+			return err
+		}
+		node := findChallengeFrameNode(root)
+		if node == nil {
+			return nil
+		}
+
+		box, err := dom.GetBoxModel().WithNodeID(node.NodeID).Do(ctx)
+		if err != nil || box == nil || len(box.Border) < 8 {
+			return err
+		}
+		// Border quad is x1,y1 … x4,y4 clockwise from the top-left.
+		left, top := box.Border[0], box.Border[1]
+		width, height := box.Border[2]-left, box.Border[5]-top
+		if width <= 0 || height <= 0 {
+			return nil
+		}
+
+		target = clickTarget{
+			Kind:    "iframe",
+			Tag:     "iframe",
+			ID:      nodeAttribute(node, "id"),
+			Title:   nodeAttribute(node, "title"),
+			Src:     nodeAttribute(node, "src"),
+			Left:    left,
+			Top:     top,
+			Width:   width,
+			Height:  height,
+			Visible: true,
+		}
+		found = true
+		return nil
+	}))
+	if err != nil {
+		b.logger.Debug("cdp lookup for the challenge frame failed", "err", err)
+		return clickTarget{}, false
+	}
+	if found {
+		b.logger.Debug("challenge frame found through a closed shadow root",
+			"id", target.ID, "rect", fmt.Sprintf("(%.0f,%.0f %.0fx%.0f)",
+				target.Left, target.Top, target.Width, target.Height))
+	}
+	return target, found
+}
+
+// findChallengeFrameNode walks a pierced DOM tree for the challenge iframe.
+// Shadow roots and iframe content documents hang off their own fields rather
+// than off Children, so all three have to be followed.
+func findChallengeFrameNode(node *cdp.Node) *cdp.Node {
+	if node == nil {
+		return nil
+	}
+	if strings.EqualFold(node.NodeName, "iframe") &&
+		strings.Contains(nodeAttribute(node, "src"), challengeFrameHost) {
+		return node
+	}
+	for _, child := range node.Children {
+		if found := findChallengeFrameNode(child); found != nil {
+			return found
+		}
+	}
+	for _, shadow := range node.ShadowRoots {
+		if found := findChallengeFrameNode(shadow); found != nil {
+			return found
+		}
+	}
+	if found := findChallengeFrameNode(node.ContentDocument); found != nil {
+		return found
+	}
+	return nil
+}
+
+func nodeAttribute(node *cdp.Node, name string) string {
+	for i := 0; i+1 < len(node.Attributes); i += 2 {
+		if node.Attributes[i] == name {
+			return node.Attributes[i+1]
+		}
+	}
+	return ""
 }
 
 func (b *chromedpBrowser) debugChallengeState(ctx context.Context, stage string) {

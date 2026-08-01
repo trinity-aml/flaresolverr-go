@@ -3,6 +3,7 @@ package w3c
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 )
 
@@ -70,10 +71,13 @@ func (s *Session) findElements(ctx context.Context, path, selector string) ([]st
 // ShadowRoot returns the shadow root hosted by elementID, or "" when the element
 // hosts none.
 //
-// Firefox answers this for closed shadow roots as well, which is what makes the
-// Turnstile widget reachable on the geckodriver backend at all: Firefox has no
-// equivalent of Chromium's --enable-blink-features=FakeShadowRoot, so this
-// endpoint is the only door in.
+// Both drivers answer this for *closed* shadow roots, which is what makes the
+// Turnstile widget reachable at all. Firefox never had an alternative. Chromium
+// used to offer one — --enable-blink-features=FakeShadowRoot, which exposed
+// el.fakeShadowRoot to page JS — but that feature is gone as of Chrome 151:
+// attaching a closed root to a fresh element and reading .fakeShadowRoot yields
+// undefined even with the flag passed. So this endpoint is now the only door in
+// on both engines.
 func (s *Session) ShadowRoot(ctx context.Context, elementID string) (string, error) {
 	raw, _, err := s.Do(ctx, http.MethodGet, s.Path("/element/"+elementID+"/shadow"), nil)
 	if err != nil {
@@ -88,6 +92,102 @@ func (s *Session) ShadowRoot(ctx context.Context, elementID string) (string, err
 		return "", err
 	}
 	return ref[ShadowKey], nil
+}
+
+// Bounds on the shadow walk. Each candidate host costs one driver round-trip,
+// so an unbounded walk on a large page is slow enough to eat a whole maxTimeout.
+const (
+	ShadowWalkMaxNodes = 400
+	ShadowWalkMaxDepth = 6
+)
+
+// FindThroughShadowDOM finds the first element matching selector, descending
+// into shadow roots when the document itself has no match. It returns the
+// element reference and how many hosts were probed getting there; both are empty
+// when nothing matched.
+//
+// Shared by every driver-based backend on purpose: the walk is expressed purely
+// in terms of the calls above, and the engine-specific part — whether a closed
+// root is handed over — happens inside ShadowRoot.
+func (s *Session) FindThroughShadowDOM(ctx context.Context, selector string) (string, int, error) {
+	ids, err := s.FindElements(ctx, selector)
+	if err != nil {
+		return "", 0, err
+	}
+	if len(ids) > 0 {
+		return ids[0], 0, nil
+	}
+
+	walked := 0
+	roots := []string{""} // "" is the document itself
+	for depth := 0; depth < ShadowWalkMaxDepth && len(roots) > 0; depth++ {
+		var deeper []string
+		for _, root := range roots {
+			hosts, err := s.findAllIn(ctx, root, "*")
+			if err != nil {
+				continue
+			}
+			for _, host := range hosts {
+				if walked >= ShadowWalkMaxNodes {
+					return "", walked, fmt.Errorf("shadow walk hit its %d-node cap", ShadowWalkMaxNodes)
+				}
+				walked++
+
+				shadow, err := s.ShadowRoot(ctx, host)
+				if err != nil || shadow == "" {
+					continue
+				}
+				if found, err := s.FindElementsInShadow(ctx, shadow, selector); err == nil && len(found) > 0 {
+					return found[0], walked, nil
+				}
+				deeper = append(deeper, shadow)
+			}
+		}
+		roots = deeper
+	}
+	return "", walked, nil
+}
+
+// findAllIn searches a shadow root, or the document when root is "".
+func (s *Session) findAllIn(ctx context.Context, root, selector string) ([]string, error) {
+	if root == "" {
+		return s.FindElements(ctx, selector)
+	}
+	return s.FindElementsInShadow(ctx, root, selector)
+}
+
+// ElementRect returns the element's position and size in viewport coordinates.
+func (s *Session) ElementRect(ctx context.Context, elementID string) (x, y, width, height float64, err error) {
+	raw, _, err := s.Do(ctx, http.MethodGet, s.Path("/element/"+elementID+"/rect"), nil)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	var rect struct {
+		X      float64 `json:"x"`
+		Y      float64 `json:"y"`
+		Width  float64 `json:"width"`
+		Height float64 `json:"height"`
+	}
+	if err := json.Unmarshal(raw, &rect); err != nil {
+		return 0, 0, 0, 0, err
+	}
+	return rect.X, rect.Y, rect.Width, rect.Height, nil
+}
+
+// ElementAttribute returns an element attribute, or "" when it is absent.
+func (s *Session) ElementAttribute(ctx context.Context, elementID, name string) (string, error) {
+	raw, _, err := s.Do(ctx, http.MethodGet, s.Path("/element/"+elementID+"/attribute/"+name), nil)
+	if err != nil {
+		if HasCode(err, CodeNoSuchElement) {
+			return "", nil
+		}
+		return "", err
+	}
+	var value *string
+	if err := json.Unmarshal(raw, &value); err != nil || value == nil {
+		return "", nil
+	}
+	return *value, nil
 }
 
 // ClickElement issues a native WebDriver click: the driver scrolls the element

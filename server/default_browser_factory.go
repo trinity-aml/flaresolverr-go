@@ -94,6 +94,15 @@ func newGeckoDriverBackend(ctx context.Context, cfg Config, browserCfg browserpk
 }
 
 func newChromeDriverBackend(ctx context.Context, cfg Config, browserCfg browserpkg.Config, proxy *Proxy) (browserClient, error) {
+	// Mirrors the geckodriver branch: each backend resolves its own browser, so
+	// neither can be handed the other engine's binary by a shared default.
+	if strings.TrimSpace(browserCfg.BrowserPath) == "" {
+		if detected := findChromeBinary(); detected != "" {
+			browserCfg.BrowserPath = detected
+			cfg.Logger.Info("detected chrome binary", "path", browserCfg.BrowserPath)
+		}
+	}
+
 	driverPath, err := resolveChromeDriverPath(cfg)
 	if err != nil {
 		cfg.Logger.Warn("webdriver backend unavailable; falling back to chromedp backend", "err", err)

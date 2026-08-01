@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -768,7 +769,12 @@ func (b *webDriverBrowser) solveChallenge(ctx context.Context) error {
 			b.logger.Debug("managed challenge: no interactive controls",
 				"attempt", attempt, "passive_streak", passiveStreak)
 			if passiveStreak >= passiveBailout {
-				return fmt.Errorf("managed challenge has no interactive controls after %d attempts; browser fingerprint likely blocked", passiveStreak)
+				// Deliberately does not blame the fingerprint any more. It used
+				// to, and was wrong every time: the controls were there, we
+				// simply could not see them once FakeShadowRoot disappeared from
+				// Chrome. clickTargets now asks the driver for closed shadow
+				// roots, so reaching this really does mean no controls exist.
+				return fmt.Errorf("managed challenge still present after %d attempts with no interactive controls", passiveStreak)
 			}
 			// Passive managed challenge: give CF more time with mouse
 			// activity instead of clicking unrelated page links.
@@ -845,24 +851,49 @@ func (b *webDriverBrowser) clickVerify(ctx context.Context, tabs int) error {
 	b.debugChallengeState(ctx, "before-click-verify")
 	_ = b.switchToDefaultContent(ctx)
 
+	// Ordered most specific first, and stopped as soon as the challenge clears.
+	//
+	// The Turnstile widget used to come *last*, which was harmless only because
+	// nothing could find it: with the widget invisible, the earlier steps were
+	// all there was. Now that clickTargets reaches into closed shadow roots, the
+	// old order actively hurts — clickTabbableChallengeTarget picks the first
+	// tabbable element on the page, and on a bare interstitial that is the
+	// "Cloudflare" footer link. Every attempt clicked a link to cloudflare.com
+	// before ever trying the checkbox.
+	//
+	// The key sequence stays last for the same reason: Tab-then-Space aims at
+	// whatever happens to be focusable rather than at the widget.
+	steps := []struct {
+		name string
+		run  func(context.Context) (bool, error)
+	}{
+		{"challenge iframe", b.clickChallengeIframes},
+		{"verify-human button", b.clickVerifyHumanButton},
+		{"verify buttons", b.clickVerifyButtons},
+		{"tabbable target", func(ctx context.Context) (bool, error) {
+			return b.clickTabbableChallengeTarget(ctx, tabs)
+		}},
+	}
+
+	for _, step := range steps {
+		clicked, err := step.run(ctx)
+		if err != nil {
+			b.logger.Debug("challenge click step failed", "step", step.name, "err", err)
+		}
+		if !clicked {
+			continue
+		}
+		cleared, err := b.waitChallengeClear(ctx, 1500*time.Millisecond)
+		if err == nil && cleared {
+			b.logger.Debug("challenge cleared", "step", step.name)
+			_ = b.switchToDefaultContent(ctx)
+			b.debugChallengeState(ctx, "after-click-verify")
+			return nil
+		}
+	}
+
 	if err := b.runWebDriverKeySequence(ctx, tabs); err != nil {
 		b.logger.Debug("cloudflare verify key sequence failed", "err", err)
-	}
-
-	if _, err := b.clickVerifyHumanButton(ctx); err != nil {
-		b.logger.Debug("cloudflare verify human button click failed", "err", err)
-	}
-
-	if _, err := b.clickTabbableChallengeTarget(ctx, tabs); err != nil {
-		b.logger.Debug("webdriver tabbable target fallback failed", "err", err)
-	}
-
-	if _, err := b.clickVerifyButtons(ctx); err != nil {
-		b.logger.Debug("cloudflare verify button click failed", "err", err)
-	}
-
-	if _, err := b.clickChallengeIframes(ctx); err != nil {
-		b.logger.Debug("cloudflare challenge iframe click failed", "err", err)
 	}
 
 	_ = b.switchToDefaultContent(ctx)
@@ -1130,6 +1161,10 @@ func (b *webDriverBrowser) waitChallengeGone(ctx context.Context, d time.Duratio
 	}
 }
 
+// challengeFrameSelector matches the cross-origin iframe Cloudflare serves the
+// Turnstile widget from.
+const challengeFrameSelector = `iframe[src*="challenges.cloudflare.com"]`
+
 func (b *webDriverBrowser) clickTargets(ctx context.Context) ([]clickTarget, error) {
 	raw, err := b.sess.Execute(ctx, browserpkg.ClickTargetsScript)
 	if err != nil {
@@ -1138,12 +1173,78 @@ func (b *webDriverBrowser) clickTargets(ctx context.Context) ([]clickTarget, err
 
 	var targets []clickTarget
 	if len(raw) == 0 || string(raw) == "null" {
-		return nil, nil
-	}
-	if err := json.Unmarshal(raw, &targets); err != nil {
+		targets = nil
+	} else if err := json.Unmarshal(raw, &targets); err != nil {
 		return nil, err
 	}
+
+	// The page-side walk above cannot see a Turnstile widget: Cloudflare hides
+	// it in a *closed* shadow root, and the escape hatch this backend used to
+	// rely on — --enable-blink-features=FakeShadowRoot exposing
+	// el.fakeShadowRoot — no longer exists in Chrome. Measured on Chrome 151:
+	// attach a closed root to a fresh element with the flag passed and
+	// .fakeShadowRoot is still undefined. The symptom was total, not partial:
+	// clickTargets returned [] on every interactive challenge, solveChallenge
+	// found no controls three times running and gave up blaming the fingerprint.
+	//
+	// The driver still hands the root over, so ask it instead. Appending rather
+	// than replacing keeps the ladder in solveChallenge working unchanged.
+	//
+	// Gated on a challenge actually being on screen, because the walk costs one
+	// round-trip per element: a challenge interstitial is ~46 nodes and the
+	// widget turns up around the 24th, but clickTargets also runs on the real
+	// page afterwards, where the same walk burned its entire 400-node cap to
+	// find something that was never there.
+	if !slices.ContainsFunc(targets, browserpkg.IsChallengeIframeTarget) {
+		if present, err := b.challengePresent(ctx); err == nil && present {
+			if frame, ok := b.challengeFrameTarget(ctx); ok {
+				targets = append(targets, frame)
+			}
+		}
+	}
 	return targets, nil
+}
+
+// challengeFrameTarget finds the Turnstile iframe through the shadow-root
+// endpoints and describes it the way the page-side walker would have.
+//
+// Every failure is silent and reported as "not found": this runs on a page that
+// may legitimately carry no widget at all, and a passive challenge must stay a
+// passive challenge rather than becoming an error.
+func (b *webDriverBrowser) challengeFrameTarget(ctx context.Context) (clickTarget, bool) {
+	frame, walked, err := b.sess.FindThroughShadowDOM(ctx, challengeFrameSelector)
+	if err != nil {
+		b.logger.Debug("shadow walk for the challenge frame failed", "walked", walked, "err", err)
+		return clickTarget{}, false
+	}
+	if frame == "" {
+		return clickTarget{}, false
+	}
+
+	x, y, width, height, err := b.sess.ElementRect(ctx, frame)
+	if err != nil || width <= 0 || height <= 0 {
+		b.logger.Debug("challenge frame has no usable rect", "err", err, "width", width, "height", height)
+		return clickTarget{}, false
+	}
+
+	src, _ := b.sess.ElementAttribute(ctx, frame, "src")
+	id, _ := b.sess.ElementAttribute(ctx, frame, "id")
+	title, _ := b.sess.ElementAttribute(ctx, frame, "title")
+	b.logger.Debug("challenge frame found through a closed shadow root",
+		"walked", walked, "id", id, "rect", fmt.Sprintf("(%.0f,%.0f %.0fx%.0f)", x, y, width, height))
+
+	return clickTarget{
+		Kind:    "iframe",
+		Tag:     "iframe",
+		ID:      id,
+		Title:   title,
+		Src:     src,
+		Left:    x,
+		Top:     y,
+		Width:   width,
+		Height:  height,
+		Visible: true,
+	}, true
 }
 
 func (b *webDriverBrowser) debugChallengeState(ctx context.Context, stage string) {
