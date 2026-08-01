@@ -267,10 +267,11 @@ func (s *Service) resolveChallenge(ctx context.Context, req *V1Request, method s
 		client = item.browser
 	}
 
+	started := time.Now()
 	res, err := client.Resolve(ctx, request)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
-			return nil, "", fmt.Errorf("Error solving the challenge. Timeout after %s seconds.", formatTimeoutSeconds(req.MaxTimeout))
+			return nil, "", resolveTimeoutError(req.MaxTimeout, time.Since(started))
 		}
 		return nil, "", fmt.Errorf("Error solving the challenge. %s", stringsReplace(err.Error()))
 	}
@@ -278,6 +279,37 @@ func (s *Service) resolveChallenge(ctx context.Context, req *V1Request, method s
 		s.storeUserAgent(res.Result.UserAgent)
 	}
 	return res.Result, res.Message, nil
+}
+
+// timeoutSlack absorbs the gap between a deadline firing inside the backend and
+// the error arriving here: teardown, the last driver round-trip, scheduling.
+const timeoutSlack = 2 * time.Second
+
+// resolveTimeoutError names the deadline that actually fired.
+//
+// Every backend builds its own maxTimeout context inside Resolve, so the context
+// this package holds never reports the budget running out — the budget and the
+// WebDriver client's own 30-second per-command timeout both surface here as a
+// bare context.DeadlineExceeded. Blaming maxTimeout for both is how a request
+// that failed after 37 seconds came back saying "Timeout after 220 seconds",
+// pointing whoever read it at a number that was never reached.
+func resolveTimeoutError(maxTimeoutMS int, elapsed time.Duration) error {
+	budget := time.Duration(maxTimeoutMS) * time.Millisecond
+	if elapsed+timeoutSlack >= budget {
+		// The wording FlareSolverr has always used here; clients match on it.
+		return fmt.Errorf("Error solving the challenge. Timeout after %s seconds.", formatTimeoutSeconds(maxTimeoutMS))
+	}
+	return fmt.Errorf("Error solving the challenge. The browser stopped responding after %s seconds, well inside the %s-second maxTimeout.",
+		formatElapsedSeconds(elapsed), formatTimeoutSeconds(maxTimeoutMS))
+}
+
+// formatElapsedSeconds renders a measured duration the way formatTimeoutSeconds
+// renders a configured one.
+func formatElapsedSeconds(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	return strconv.FormatFloat(d.Seconds(), 'f', 1, 64)
 }
 
 func formatTimeoutSeconds(timeoutMS int) string {
