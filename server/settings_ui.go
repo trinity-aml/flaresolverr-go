@@ -285,7 +285,7 @@ const settingsPageHTML = `<!DOCTYPE html>
             </select>
           </div>
           <div class="field full">
-            <label for="browserPath">Browser Path <span class="muted">— Chrome or Firefox/Camoufox binary</span></label>
+            <label for="browserPath">Browser Path <span class="muted">— Chrome or Firefox/Camoufox binary; empty = auto-detect</span></label>
             <input id="browserPath" name="browserPath" type="text" />
           </div>
           <div class="field full">

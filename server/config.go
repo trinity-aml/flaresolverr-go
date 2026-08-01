@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -222,7 +223,7 @@ func SaveConfig(cfg Config) (string, error) {
 
 func saveConfigToPath(path string, cfg Config) error {
 	fileCfg := configFileFromConfig(cfg)
-	data, err := yaml.Marshal(&fileCfg)
+	data, err := renderConfigYAML(path, fileCfg)
 	if err != nil {
 		return fmt.Errorf("marshal init.yaml: %w", err)
 	}
@@ -253,6 +254,157 @@ func saveConfigToPath(path string, cfg Config) error {
 		return fmt.Errorf("replace init.yaml: %w", err)
 	}
 	return nil
+}
+
+// renderConfigYAML produces the bytes to write, editing the existing file's node
+// tree in place rather than re-marshalling from scratch.
+//
+// Marshalling the struct is lossy in a way that matters: init.yaml ships with a
+// header, an explanation of every browser_backend value and a commented-out
+// proxy block, and a plain yaml.Marshal reduced all of that to eleven bare
+// lines. Saving once from /settings therefore destroyed the documentation in the
+// user's own config — including the keys whose value is empty, which omitempty
+// drops entirely.
+//
+// Anything unparseable, missing or shaped unexpectedly falls back to the plain
+// render: saving settings must not fail because a config file is malformed.
+func renderConfigYAML(path string, fileCfg configFile) ([]byte, error) {
+	desired, err := mappingNodeOf(fileCfg)
+	if err != nil {
+		return nil, err
+	}
+
+	existing, err := os.ReadFile(path)
+	if err != nil {
+		return yaml.Marshal(&fileCfg)
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(existing, &doc); err != nil {
+		return yaml.Marshal(&fileCfg)
+	}
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 || doc.Content[0].Kind != yaml.MappingNode {
+		return yaml.Marshal(&fileCfg)
+	}
+
+	mergeMapping(doc.Content[0], desired, configFileKeys())
+	preserveBlankLines(doc.Content[0], string(existing))
+	return yaml.Marshal(&doc)
+}
+
+// preserveBlankLines re-attaches the blank lines that separate groups of keys.
+//
+// yaml.v3 records comments but not blank lines, so a re-marshal runs the whole
+// file together and loses the grouping. It does emit one for a HeadComment that
+// starts with a newline, which is the only lever available — so find the keys
+// that had a blank line above them in the source and mark them.
+func preserveBlankLines(mapping *yaml.Node, source string) {
+	lines := strings.Split(source, "\n")
+
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if i == 0 {
+			// A blank above the very first key belongs to the document's own
+			// head comment, which already emits one. Adding another doubles it.
+			continue
+		}
+		key := mapping.Content[i]
+		if key.Line <= 0 || strings.HasPrefix(key.HeadComment, "\n") {
+			continue
+		}
+
+		// key.Line is the key itself; its head comment sits on the lines above.
+		above := key.Line - 2
+		for above >= 0 && above < len(lines) && strings.HasPrefix(strings.TrimSpace(lines[above]), "#") {
+			above--
+		}
+		if above >= 0 && above < len(lines) && strings.TrimSpace(lines[above]) == "" {
+			key.HeadComment = "\n" + key.HeadComment
+		}
+	}
+}
+
+// mappingNodeOf marshals v and returns its top-level mapping node.
+func mappingNodeOf(v any) (*yaml.Node, error) {
+	data, err := yaml.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return nil, err
+	}
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 || doc.Content[0].Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("config did not marshal to a mapping")
+	}
+	return doc.Content[0], nil
+}
+
+// configFileKeys is the set of yaml keys configFile owns, read off the struct
+// tags so it cannot drift from them.
+func configFileKeys() map[string]struct{} {
+	keys := map[string]struct{}{}
+	t := reflect.TypeOf(configFile{})
+	for i := 0; i < t.NumField(); i++ {
+		tag := t.Field(i).Tag.Get("yaml")
+		if name, _, _ := strings.Cut(tag, ","); name != "" && name != "-" {
+			keys[name] = struct{}{}
+		}
+	}
+	return keys
+}
+
+// mergeMapping writes src's values into dst, keeping dst's key order, comments
+// and any keys it does not own.
+func mergeMapping(dst, src *yaml.Node, owned map[string]struct{}) {
+	index := map[string]int{}
+	for i := 0; i+1 < len(dst.Content); i += 2 {
+		index[dst.Content[i].Value] = i
+	}
+
+	seen := map[string]struct{}{}
+	for i := 0; i+1 < len(src.Content); i += 2 {
+		key, value := src.Content[i], src.Content[i+1]
+		seen[key.Value] = struct{}{}
+
+		at, ok := index[key.Value]
+		if !ok {
+			// A key the file does not carry yet — a knob added since it was
+			// written. Append it with the comment the marshalled struct had.
+			dst.Content = append(dst.Content, key, value)
+			index[key.Value] = len(dst.Content) - 2
+			continue
+		}
+
+		old := dst.Content[at+1]
+		if old.Kind == yaml.MappingNode && value.Kind == yaml.MappingNode {
+			mergeMapping(old, value, owned)
+			continue
+		}
+		// Carry the old node's comments onto the new value: they annotate the
+		// setting, not the particular value that happened to be there.
+		value.HeadComment = old.HeadComment
+		value.LineComment = old.LineComment
+		value.FootComment = old.FootComment
+		dst.Content[at+1] = value
+	}
+
+	// Keys the file has that the struct dropped. Every omitempty field in
+	// configFile is either a string or the proxy mapping, so an absent one means
+	// "empty" — write that rather than deleting the line, which would take the
+	// key's comments with it. A dropped mapping really is gone, though.
+	for i := 0; i+1 < len(dst.Content); {
+		key, value := dst.Content[i], dst.Content[i+1]
+		_, isOwned := owned[key.Value]
+		_, isSet := seen[key.Value]
+		switch {
+		case !isOwned || isSet:
+			i += 2
+		case value.Kind == yaml.ScalarNode:
+			value.SetString("")
+			i += 2
+		default:
+			dst.Content = append(dst.Content[:i], dst.Content[i+2:]...)
+		}
+	}
 }
 
 func configFileFromConfig(cfg Config) configFile {

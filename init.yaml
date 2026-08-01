@@ -9,12 +9,16 @@ host: 0.0.0.0
 port: 8191
 
 # auto | chromedriver | geckodriver
-#   auto         - infer from the browser_path binary name (default)
+#   auto         - infer from the browser_path binary name (default); when
+#                  browser_path is empty, Chrome wins if it is installed and
+#                  geckodriver is chosen only if Firefox/Camoufox is all there is
 #   chromedriver - Chrome/Chromium via a patched chromedriver
 #   geckodriver  - Firefox/Camoufox via geckodriver
 # Aliases: chrome/chromium -> chromedriver, firefox/camoufox -> geckodriver.
 browser_backend: auto
 
+# Empty = detect automatically, per backend: Chrome/Chromium for chromedriver,
+# Camoufox (preferred) or Firefox for geckodriver. Set it only to override.
 browser_path: ""
 driver_path: ""
 driver_cache_dir: ""
