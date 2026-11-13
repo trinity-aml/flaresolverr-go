@@ -84,7 +84,7 @@ func NewGeckoDriver(ctx context.Context, cfg Config, proxy *Proxy) (Client, erro
 		proxy:           proxy,
 		previousDisplay: os.Getenv("DISPLAY"),
 		sess: &w3c.Session{
-			HTTP:      &http.Client{Timeout: 30 * time.Second},
+			HTTP:      w3c.NewHTTPClient(),
 			ErrPrefix: "geckodriver",
 		},
 	}

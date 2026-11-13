@@ -22,12 +22,45 @@ import (
 	"strings"
 
 	browserpkg "github.com/trinity-aml/flaresolverr-go/server/browser"
+	"time"
 )
 
 // Session is a live WebDriver session on one driver process.
 //
 // It is not safe for concurrent use; both backends already serialize their
 // calls behind the browser-level mutex.
+// CommandBackstop bounds a single WebDriver command as a **last resort**, not
+// as the operative deadline.
+//
+// Every command already carries the caller's context (see Session.Do, which
+// uses http.NewRequestWithContext), and that context is derived from the
+// request's maxTimeout. A shorter timeout on the http.Client is a second
+// deadline that knows nothing about maxTimeout and fires first, which makes the
+// caller's budget unreachable.
+//
+// Both backends used to hardcode 30s here. On a loaded machine a single
+// navigation to a Cloudflare challenge page with a headed browser routinely
+// takes longer than that, so the solve was killed at 30s even though the client
+// had allowed 90s. Measured on a production jacred box: **665 of these in 24
+// hours**, concentrated on the three Cloudflare-gated trackers (rutracker 144,
+// bitru 127, kinozal 50), each one surfacing as
+// `The browser stopped responding after N seconds, well inside the 90-second
+// maxTimeout` — a message that was literally true and whose cause was this
+// constant. The histogram of N had a spike at exactly 30.0, which is the
+// signature of this timeout firing on the first command of a solve.
+//
+// The invariant: this must stay comfortably above the largest maxTimeout any
+// client sets, so that it never pre-empts the real budget. It exists only so a
+// caller that somehow passes a context without a deadline cannot hang forever.
+const CommandBackstop = 5 * time.Minute
+
+// NewHTTPClient builds the HTTP client a Session should use. Prefer it over
+// constructing one inline, so the backstop above has one definition rather than
+// one per backend.
+func NewHTTPClient() *http.Client {
+	return &http.Client{Timeout: CommandBackstop}
+}
+
 type Session struct {
 	HTTP    *http.Client
 	BaseURL string

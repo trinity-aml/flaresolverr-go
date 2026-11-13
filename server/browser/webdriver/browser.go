@@ -95,7 +95,7 @@ func NewWebDriver(ctx context.Context, cfg Config, proxy *Proxy) (Client, error)
 		proxy:           proxy,
 		previousDisplay: os.Getenv("DISPLAY"),
 		sess: &w3c.Session{
-			HTTP:      &http.Client{Timeout: 30 * time.Second},
+			HTTP:      w3c.NewHTTPClient(),
 			ErrPrefix: "webdriver",
 		},
 	}
