@@ -506,7 +506,18 @@ func StartXvfb(ctx context.Context, xvfbPath string) (*XvfbProcess, string, erro
 }
 
 func CreateTransientDir(prefix string) (string, error) {
+	// Before making a new one, drop the ones whose owner died. This is the
+	// only creation point for every transient directory the library makes, so
+	// hanging the sweep here means no backend and no caller can forget it.
+	// See transientsweep.go for why a teardown fix would not be enough.
+	transientSweepOnce.Do(func() {
+		if removed, freed := SweepStaleTransientDirs(); removed > 0 {
+			transientSweepReport = fmt.Sprintf("removed %d stale transient dir(s), freed %.1f MB", removed, float64(freed)/(1<<20))
+		}
+	})
+
 	if dir, err := createTransientDirInPreferredRoot(prefix); err == nil {
+		writeTransientOwner(dir)
 		return dir, nil
 	}
 
@@ -522,11 +533,25 @@ func CreateTransientDir(prefix string) (string, error) {
 			transientDirRootMu.Lock()
 			transientDirRoot = root
 			transientDirRootMu.Unlock()
+			writeTransientOwner(dir)
 			return dir, nil
 		}
 	}
-	return os.MkdirTemp("", prefix)
+	dir, err := os.MkdirTemp("", prefix)
+	if err == nil {
+		writeTransientOwner(dir)
+	}
+	return dir, err
 }
+
+// transientSweepReport holds what the startup sweep did, so a caller can log
+// it with its own logger rather than this package reaching for a global one.
+var transientSweepReport string
+
+// TransientSweepReport returns a one-line summary of the stale-directory
+// sweep, or "" when it removed nothing. Read it after the first browser
+// session is created.
+func TransientSweepReport() string { return transientSweepReport }
 
 func createTransientDirInPreferredRoot(prefix string) (string, error) {
 	transientDirRootMu.Lock()

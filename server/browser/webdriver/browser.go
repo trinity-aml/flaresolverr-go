@@ -148,10 +148,88 @@ func (b *webDriverBrowser) Resolve(ctx context.Context, req Request) (*Result, e
 	defer cancel()
 
 	result, message, err := b.resolve(runCtx, req)
+	// Sweep before returning, on the error path too: a failed solve is exactly
+	// when a stray tab is most likely to have been left behind.
+	b.sweepStrayWindows(ctx)
 	if err != nil {
 		return nil, err
 	}
 	return &Result{Result: result, Message: message}, nil
+}
+
+// sweepStrayWindows closes every tab except the one this session drives.
+//
+// **This is the renderer leak.** A `request.get` navigates a single window, so
+// any other top-level context belongs to something the *page* opened, and
+// nothing in this library ever closed them. A live tab means a live document,
+// which means its renderer process cannot be retired — not by Chrome's zygote,
+// not by `--renderer-process-limit` (strict site isolation gives a different
+// site its own process whatever the limit says, which is why the cap read 4
+// while the process count sat at 9).
+//
+// Measured on the production box 2026-11-14 through Chrome's own DevTools
+// target list, 79 minutes into one session:
+//
+//	11 targets: 8 page, 1 iframe, 2 worker
+//	7 of the 8 pages were https://www.cloudflare.com/?utm_source=challenge&…
+//
+// — the Cloudflare branding link from the challenge interstitial, opened in a
+// new tab seven times and never closed, at ~230 MB of renderer each. The
+// renderer count went 5 → 7 → 9 over 90 seconds while the cgroup's anonymous
+// memory went 1207 → 1765 MB.
+//
+// **What opens it is not pinned down**, and the sweep is deliberately written
+// not to care. The click path sends Tab then Space, and Space does not
+// activate a link, so the obvious culprit does not explain it; the branding
+// anchor is tabbable and `FallbackChallengeTargets` only ever selects
+// iframes, buttons and inputs. Rather than guess at a preventer that might
+// cover one variant, this closes whatever is there — which also covers the
+// next thing a challenge page decides to open.
+//
+// Two WebDriver details are load-bearing. Closing the *current* window leaves
+// the session with no current context, so the handle to keep is selected
+// first and switched back to at the end. And a handle can vanish between the
+// list and the switch, so every per-window error is logged and skipped rather
+// than aborting the sweep — this runs on the way out of a request that has
+// already produced its answer, and must never turn a good result into an
+// error.
+func (b *webDriverBrowser) sweepStrayWindows(ctx context.Context) {
+	if b.sess == nil {
+		return
+	}
+	// A short budget of its own: the request's context may already be done,
+	// and this still has to run.
+	sweepCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancel()
+
+	handles, err := b.sess.WindowHandles(sweepCtx)
+	if err != nil || len(handles) <= 1 {
+		return
+	}
+	keep, err := b.sess.WindowHandle(sweepCtx)
+	if err != nil || keep == "" {
+		keep = handles[0]
+	}
+	closed := 0
+	for _, h := range handles {
+		if h == keep {
+			continue
+		}
+		if err := b.sess.SwitchToWindow(sweepCtx, h); err != nil {
+			continue
+		}
+		if err := b.sess.CloseWindow(sweepCtx); err != nil {
+			continue
+		}
+		closed++
+	}
+	// Whatever happened above, commands must land somewhere again.
+	if err := b.sess.SwitchToWindow(sweepCtx, keep); err != nil {
+		b.logger.Warn("could not switch back after sweeping stray windows", "err", err)
+	}
+	if closed > 0 {
+		b.logger.Info("closed stray browser tabs the page opened", "closed", closed, "kept", 1)
+	}
 }
 
 func (b *webDriverBrowser) Close() error {

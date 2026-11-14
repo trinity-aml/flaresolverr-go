@@ -247,6 +247,40 @@ func (s *Session) getString(ctx context.Context, path string) (string, error) {
 	return value, nil
 }
 
+// WindowHandles lists the session's open top-level browsing contexts — every
+// tab and window. A `request.get` navigates one of them; anything else in the
+// list was opened by the page and nobody is going to close it.
+func (s *Session) WindowHandles(ctx context.Context) ([]string, error) {
+	raw, _, err := s.Do(ctx, http.MethodGet, s.Path("/window/handles"), nil)
+	if err != nil {
+		return nil, err
+	}
+	var handles []string
+	if err := json.Unmarshal(raw, &handles); err != nil {
+		return nil, err
+	}
+	return handles, nil
+}
+
+// WindowHandle returns the handle of the context commands currently go to.
+func (s *Session) WindowHandle(ctx context.Context) (string, error) {
+	return s.getString(ctx, "/window")
+}
+
+// SwitchToWindow points subsequent commands at a different tab or window.
+func (s *Session) SwitchToWindow(ctx context.Context, handle string) error {
+	_, _, err := s.Do(ctx, http.MethodPost, s.Path("/window"), map[string]any{"handle": handle})
+	return err
+}
+
+// CloseWindow closes the current context. WebDriver leaves the session with no
+// current context afterwards, so the caller must switch to a surviving handle
+// before issuing anything else — see sweepStrayWindows.
+func (s *Session) CloseWindow(ctx context.Context) error {
+	_, _, err := s.Do(ctx, http.MethodDelete, s.Path("/window"), nil)
+	return err
+}
+
 func (s *Session) HTML(ctx context.Context) (string, error) {
 	return s.ExecuteString(ctx, `document.documentElement ? document.documentElement.outerHTML : ''`)
 }
