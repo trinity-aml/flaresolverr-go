@@ -146,7 +146,33 @@ func (b *chromedpBrowser) execAllocatorOptions(ctx context.Context) ([]chromedp.
 		chromedp.Flag("disable-search-engine-choice-screen", true),
 		chromedp.Flag("disable-setuid-sandbox", true),
 		chromedp.Flag("disable-dev-shm-usage", true),
-		chromedp.Flag("no-zygote", true),
+		// Chrome's zygote is what *reaps* renderer processes when their page
+		// goes away. With --no-zygote each renderer is forked straight off the
+		// browser process and nothing retires it, so a long-lived session
+		// accumulates one renderer per site instance for as long as it runs.
+		//
+		// Measured on the production box 2026-11-14 inside one 57-minute
+		// browser session: **77 live `--type=renderer` processes at ~230 MB
+		// each, zero `--type=zygote`**, every one of them parented directly to
+		// the browser main process, a new one about every 23 seconds and not a
+		// single exit. The service cgroup's anonymous memory went 589 MB →
+		// 6723 MB in an hour (~77 MB/min) while the Go runtime's own `sys`
+		// stayed flat at 1066–1195 MB — i.e. all of it was in child processes,
+		// which is exactly the part a Go heap profile cannot see.
+		//
+		// The flag has been here since the initial commit (7c31df6), so it was
+		// inherited with a copied flag set rather than chosen. Do not restore
+		// it: it buys nothing here and it is the whole mechanism behind
+		// jacred's long runs climbing to ~77% of the box's RAM.
+		// A hard ceiling under the zygote fix, not instead of it. One
+		// navigation to a Cloudflare page needs the main document's renderer
+		// plus a separate one for the cross-origin challenges.cloudflare.com
+		// iframe, and this session navigates one window at a time, so four is
+		// comfortable slack. Reusing a renderer across sites weakens site
+		// isolation, which is meaningless for an automation browser driving
+		// one page at a time, and this is Chrome's own documented knob for
+		// memory-constrained hosts.
+		chromedp.Flag("renderer-process-limit", "4"),
 		chromedp.Flag("ignore-certificate-errors", true),
 		chromedp.Flag("ignore-ssl-errors", true),
 		chromedp.Flag("remote-allow-origins", "*"),
