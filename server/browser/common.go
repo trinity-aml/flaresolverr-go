@@ -856,3 +856,69 @@ func transientDirRoots() []string {
 	roots = append(roots, "/dev/shm/flaresolverr-go")
 	return roots
 }
+
+// localeTagPattern accepts a BCP-47 language tag: a 2–3 letter primary
+// subtag, optionally followed by subtags of 2–8 alphanumerics.
+var localeTagPattern = regexp.MustCompile(`^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$`)
+
+// AcceptLanguageFromLocale turns a POSIX locale into a language tag fit for
+// Chrome's --accept-lang / --lang and for Emulation.setUserAgentOverride.
+//
+// Both backends used to pass $LANG straight through, and on a box whose system
+// locale is the usual `ru_RU.UTF-8` that is not a language tag at all. Measured
+// against a local echo server with this very browser build:
+//
+//	--accept-lang=ru_RU.UTF-8  ->  Accept-Language: ru_RU.UTF-8,ru_RU.UTF;q=0.9
+//	--accept-lang=en_US.UTF-8  ->  Accept-Language: en_US.UTF-8,en_US.UTF;q=0.9
+//	--accept-lang=ru-RU        ->  Accept-Language: ru-RU,ru;q=0.9
+//
+// The first two are headers no browser can produce: an underscore, a charset
+// suffix, and a truncated `ru_RU.UTF` fallback Chrome invents by cutting at the
+// last dot. The third is exactly what a real Chrome sends. The same raw value
+// also reached `acceptLanguage` on setUserAgentOverride, which drives
+// `navigator.language` and `navigator.languages` — so the page could read the
+// locale back and see a string no browser reports.
+//
+// Deliberately returns "" rather than a guess for `C`, `POSIX`, an empty value
+// or anything that does not parse: the callers all have their own fallback, and
+// inventing a language for a host that declined to state one is worse than
+// letting Chrome use its own default.
+//
+// A full header value (`ru-RU,ru;q=0.9`) is reduced to its primary tag, because
+// Chrome appends its own fallback to whatever it is given and would otherwise
+// emit `ru-RU,ru;q=0.9,ru;q=0.9;q=0.8`.
+func AcceptLanguageFromLocale(locale string) string {
+	tag := strings.TrimSpace(locale)
+	// A header value, not a locale: keep the primary tag only.
+	if i := strings.IndexAny(tag, ",;"); i >= 0 {
+		tag = strings.TrimSpace(tag[:i])
+	}
+	// Charset suffix (.UTF-8) and modifier (@euro) are locale syntax.
+	if i := strings.IndexAny(tag, ".@"); i >= 0 {
+		tag = tag[:i]
+	}
+	tag = strings.ReplaceAll(tag, "_", "-")
+	switch strings.ToUpper(tag) {
+	case "", "C", "POSIX":
+		return ""
+	}
+	if !localeTagPattern.MatchString(tag) {
+		return ""
+	}
+	parts := strings.Split(tag, "-")
+	parts[0] = strings.ToLower(parts[0])
+	// Canonical casing for a 2-letter region, which is all these locales carry.
+	if len(parts) > 1 && len(parts[1]) == 2 {
+		parts[1] = strings.ToUpper(parts[1])
+	}
+	return strings.Join(parts, "-")
+}
+
+// BrowserAcceptLanguage is AcceptLanguageFromLocale over $LANG, with the
+// caller's fallback when the environment says nothing usable.
+func BrowserAcceptLanguage(fallback string) string {
+	if tag := AcceptLanguageFromLocale(os.Getenv("LANG")); tag != "" {
+		return tag
+	}
+	return fallback
+}

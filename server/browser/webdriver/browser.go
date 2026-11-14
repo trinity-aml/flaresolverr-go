@@ -473,7 +473,11 @@ func (b *webDriverBrowser) chromeArgs() []string {
 	if b.effectiveHeadless {
 		args = append(args, "--headless=new")
 	}
-	if lang := os.Getenv("LANG"); strings.TrimSpace(lang) != "" {
+	// Normalised, never the raw $LANG: a POSIX locale is not a language tag,
+	// and `--accept-lang=ru_RU.UTF-8` makes Chrome send
+	// `Accept-Language: ru_RU.UTF-8,ru_RU.UTF;q=0.9`, which no browser can
+	// produce. See browser.AcceptLanguageFromLocale for the measurements.
+	if lang := browserpkg.AcceptLanguageFromLocale(os.Getenv("LANG")); lang != "" {
 		args = append(args, "--accept-lang="+lang, "--lang="+lang)
 	}
 	if ua := strings.TrimSpace(b.cfg.StartupUserAgent); ua != "" {
@@ -728,8 +732,10 @@ func (b *webDriverBrowser) installStealth(ctx context.Context) error {
 		return nil
 	}
 	if _, err := b.executeCDP(context.Background(), "Emulation.setUserAgentOverride", map[string]any{
-		"userAgent":      overrideUA,
-		"acceptLanguage": firstNonEmpty(os.Getenv("LANG"), "en-US"),
+		"userAgent": overrideUA,
+		// Normalised: this value is also what `navigator.language` and
+		// `navigator.languages` report back to the page.
+		"acceptLanguage": browserpkg.BrowserAcceptLanguage("en-US"),
 		"platform":       runtime.GOOS,
 	}); err != nil {
 		// Not fatal — the browser is still usable — but per the note above this

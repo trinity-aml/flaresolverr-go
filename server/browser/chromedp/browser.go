@@ -190,7 +190,8 @@ func (b *chromedpBrowser) execAllocatorOptions(ctx context.Context) ([]chromedp.
 	if b.cfg.BrowserPath != "" {
 		opts = append(opts, chromedp.ExecPath(b.cfg.BrowserPath))
 	}
-	if lang := os.Getenv("LANG"); lang != "" {
+	// Normalised, never the raw $LANG — see browser.AcceptLanguageFromLocale.
+	if lang := browserpkg.AcceptLanguageFromLocale(os.Getenv("LANG")); lang != "" {
 		opts = append(opts, chromedp.Flag("accept-lang", lang))
 		opts = append(opts, chromedp.Flag("lang", lang))
 	}
@@ -371,7 +372,7 @@ func (b *chromedpBrowser) installStealth() error {
 			if err := emulation.SetFocusEmulationEnabled(true).Do(ctx); err != nil {
 				b.logger.Debug("focus emulation setup failed", "err", err)
 			}
-			if err := emulation.SetUserAgentOverride(overrideUA).WithAcceptLanguage(firstNonEmpty(os.Getenv("LANG"), "en-US")).WithPlatform(runtime.GOOS).Do(ctx); err != nil {
+			if err := emulation.SetUserAgentOverride(overrideUA).WithAcceptLanguage(browserpkg.BrowserAcceptLanguage("en-US")).WithPlatform(runtime.GOOS).Do(ctx); err != nil {
 				b.logger.Debug("user agent override failed", "err", err)
 				return nil
 			}
