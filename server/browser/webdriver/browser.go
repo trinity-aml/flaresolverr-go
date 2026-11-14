@@ -971,6 +971,7 @@ func (b *webDriverBrowser) clickVerify(ctx context.Context, tabs int) error {
 		name string
 		run  func(context.Context) (bool, error)
 	}{
+		{"turnstile checkbox", b.clickTurnstileCheckbox},
 		{"challenge iframe", b.clickChallengeIframes},
 		{"verify-human button", b.clickVerifyHumanButton},
 		{"verify buttons", b.clickVerifyButtons},
@@ -1428,6 +1429,129 @@ func (b *webDriverBrowser) performActions(ctx context.Context, actions []map[str
 func (b *webDriverBrowser) releaseActions(ctx context.Context) error {
 	_, _, err := b.sess.Do(ctx, http.MethodDelete, b.sess.Path("/actions"), nil)
 	return err
+}
+
+// switchToFrameIndex enters the Nth frame of the current browsing context.
+// WebDriver scopes script evaluation and pointer coordinates to whatever
+// context is current, which is what makes the checkbox reachable at all.
+func (b *webDriverBrowser) switchToFrameIndex(ctx context.Context, index int) error {
+	_, _, err := b.sess.Do(ctx, http.MethodPost, b.sess.Path("/frame"), map[string]any{
+		"id": index,
+	})
+	return err
+}
+
+// frameCount reports how many frames the current context holds.
+func (b *webDriverBrowser) frameCount(ctx context.Context) (int, error) {
+	raw, err := b.sess.Execute(ctx, `(() => window.frames ? window.frames.length : 0)()`)
+	if err != nil {
+		return 0, err
+	}
+	var n int
+	if err := json.Unmarshal(raw, &n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// maxCheckboxFrameDepth bounds the frame walk. Turnstile nests its widget one
+// or two frames deep; the bound is there so a page that frames itself cannot
+// spend the whole solve budget on a descent.
+const maxCheckboxFrameDepth = 3
+
+// clickTurnstileCheckbox finds the widget's own <input type="checkbox"> and
+// clicks it where it actually is, descending into frames to do so.
+//
+// This step did not exist, and its absence is why the click path could not
+// solve an interactive challenge. The collector walks the document and its
+// shadow roots but never an iframe's content document, and Turnstile renders
+// its checkbox inside a cross-origin frame — so the one element worth clicking
+// was invisible to every heuristic, while the interstitial's branding link was
+// visible to one of them. Clicking the iframe's box from the outside, which is
+// what the existing step does, aims at where the checkbox is *expected* to be;
+// this aims at where it reports itself to be.
+//
+// The caller is responsible for returning to the default context: every path
+// out of here leaves the session wherever the walk ended, and clickVerify
+// already calls switchToDefaultContent around its steps.
+func (b *webDriverBrowser) clickTurnstileCheckbox(ctx context.Context) (bool, error) {
+	_ = b.switchToDefaultContent(ctx)
+	clicked, err := b.clickCheckboxInContext(ctx, 0)
+	_ = b.switchToDefaultContent(ctx)
+	return clicked, err
+}
+
+func (b *webDriverBrowser) clickCheckboxInContext(ctx context.Context, depth int) (bool, error) {
+	if depth > maxCheckboxFrameDepth {
+		return false, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+
+	targets, err := b.clickTargets(ctx)
+	if err == nil {
+		for _, target := range targets {
+			if !browserpkg.IsTurnstileCheckboxTarget(target) {
+				continue
+			}
+			// The widget sets aria-checked the moment the click lands, long
+			// before the page navigates away. Clicking again in that window is
+			// at best wasted and at worst reads as a double-click.
+			if browserpkg.TargetAlreadyChecked(target) {
+				b.logger.Debug("turnstile checkbox already checked", "target", summarizeClickTarget(target))
+				return true, nil
+			}
+			for _, candidate := range clickPointsForTarget(target) {
+				if err := b.clickAt(ctx, candidate); err != nil {
+					b.logger.Debug("turnstile checkbox click failed", "target", summarizeClickTarget(target), "err", err)
+					continue
+				}
+				b.logger.Info("clicked the turnstile checkbox", "depth", depth, "target", summarizeClickTarget(target))
+				return true, nil
+			}
+		}
+	} else {
+		b.logger.Debug("collecting click targets failed", "depth", depth, "err", err)
+	}
+
+	frames, err := b.frameCount(ctx)
+	if err != nil || frames == 0 {
+		return false, nil
+	}
+	for i := 0; i < frames; i++ {
+		if err := b.switchToFrameIndex(ctx, i); err != nil {
+			b.logger.Debug("switching into frame failed", "index", i, "depth", depth, "err", err)
+			continue
+		}
+		clicked, err := b.clickCheckboxInContext(ctx, depth+1)
+		if clicked || err != nil {
+			return clicked, err
+		}
+		// Back out to this level before trying the next sibling: a frame
+		// switch is absolute, so there is no "parent" to step up to without
+		// re-walking from the top.
+		if err := b.returnToDepth(ctx, depth); err != nil {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
+// returnToDepth re-enters the frame chain from the document root. WebDriver
+// has no "switch to parent" that survives a cross-origin hop reliably, and the
+// walk only ever descends by index, so replaying the descent is both correct
+// and cheap at these depths.
+func (b *webDriverBrowser) returnToDepth(ctx context.Context, depth int) error {
+	if err := b.switchToDefaultContent(ctx); err != nil {
+		return err
+	}
+	for i := 0; i < depth; i++ {
+		if err := b.switchToFrameIndex(ctx, 0); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (b *webDriverBrowser) switchToDefaultContent(ctx context.Context) error {

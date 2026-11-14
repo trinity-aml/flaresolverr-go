@@ -35,6 +35,7 @@ const ClickTargetsScript = `(() => {
 			title: el.getAttribute ? (el.getAttribute('title') || '') : '',
 			ariaLabel: el.getAttribute ? (el.getAttribute('aria-label') || '') : '',
 			role: el.getAttribute ? (el.getAttribute('role') || '') : '',
+			ariaChecked: el.getAttribute ? (el.getAttribute('aria-checked') || '') : '',
 			className: typeof el.className === 'string' ? el.className : '',
 			tabIndex: typeof el.tabIndex === 'number' ? el.tabIndex : -1,
 			disabled: !!el.disabled || (el.getAttribute && el.getAttribute('aria-disabled') === 'true'),

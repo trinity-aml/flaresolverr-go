@@ -66,24 +66,29 @@ var BlockedURLs = []string{
 }
 
 type ClickTarget struct {
-	Kind      string  `json:"kind"`
-	Tag       string  `json:"tag"`
-	Type      string  `json:"type"`
-	Text      string  `json:"text"`
-	ID        string  `json:"id"`
-	Name      string  `json:"name"`
-	Title     string  `json:"title"`
-	AriaLabel string  `json:"ariaLabel"`
-	Role      string  `json:"role"`
-	ClassName string  `json:"className"`
-	TabIndex  int64   `json:"tabIndex"`
-	Disabled  bool    `json:"disabled"`
-	Src       string  `json:"src"`
-	Left      float64 `json:"left"`
-	Top       float64 `json:"top"`
-	Width     float64 `json:"width"`
-	Height    float64 `json:"height"`
-	Visible   bool    `json:"visible"`
+	Kind      string `json:"kind"`
+	Tag       string `json:"tag"`
+	Type      string `json:"type"`
+	Text      string `json:"text"`
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Title     string `json:"title"`
+	AriaLabel string `json:"ariaLabel"`
+	Role      string `json:"role"`
+	// AriaChecked is the widget's own answer to "has this already been
+	// clicked". Turnstile sets aria-checked="true" on its checkbox the moment
+	// the click lands, well before the page navigates away, so re-clicking in
+	// the meantime is at best wasted and at worst reads as a double-click.
+	AriaChecked string  `json:"ariaChecked"`
+	ClassName   string  `json:"className"`
+	TabIndex    int64   `json:"tabIndex"`
+	Disabled    bool    `json:"disabled"`
+	Src         string  `json:"src"`
+	Left        float64 `json:"left"`
+	Top         float64 `json:"top"`
+	Width       float64 `json:"width"`
+	Height      float64 `json:"height"`
+	Visible     bool    `json:"visible"`
 }
 
 type Point struct {
@@ -261,14 +266,52 @@ func IsChallengeIframeTarget(target ClickTarget) bool {
 	return target.Width >= 240 && target.Width <= 420 && target.Height >= 40 && target.Height <= 120
 }
 
+// IsTurnstileCheckboxTarget identifies the one element a Turnstile challenge
+// actually wants clicked: its <input type="checkbox">.
+//
+// Naming the element instead of describing it is the whole point. The old code
+// had no checkbox case at all, so the widget was reached only by heuristics —
+// "a button-ish thing between 40 and 500 pixels wide", "an element whose text
+// says verify you are human" — and a 24x24 checkbox with no text matches
+// neither. Meanwhile the interstitial's Cloudflare branding link did match the
+// tabbable heuristic, so on the production box every failed solve opened three
+// tabs on www.cloudflare.com and never touched the widget.
+//
+// Deliberately no size bound: the checkbox is small by construction, and the
+// tag plus the type is already an exact identification.
+func IsTurnstileCheckboxTarget(target ClickTarget) bool {
+	if !target.Visible || target.Disabled {
+		return false
+	}
+	if target.Width <= 0 || target.Height <= 0 {
+		return false
+	}
+	return target.Tag == "input" && strings.EqualFold(strings.TrimSpace(target.Type), "checkbox")
+}
+
+// TargetAlreadyChecked reports that the widget says it has been clicked, so
+// clicking it again would be pure noise.
+func TargetAlreadyChecked(target ClickTarget) bool {
+	return strings.EqualFold(strings.TrimSpace(target.AriaChecked), "true")
+}
+
+// RelevantChallengeTargets returns the targets worth clicking, most specific
+// first: the checkbox itself, then an explicit verify button, then the
+// challenge iframe. Order is the contract here — the caller clicks in sequence
+// and stops as soon as the challenge clears, so a precise target that comes
+// after a vague one is a target that mostly never gets tried.
 func RelevantChallengeTargets(targets []ClickTarget) []ClickTarget {
-	relevant := make([]ClickTarget, 0, len(targets))
+	checkboxes := make([]ClickTarget, 0, 2)
+	others := make([]ClickTarget, 0, len(targets))
 	for _, target := range targets {
-		if IsVerifyButtonTarget(target) || IsChallengeIframeTarget(target) {
-			relevant = append(relevant, target)
+		switch {
+		case IsTurnstileCheckboxTarget(target):
+			checkboxes = append(checkboxes, target)
+		case IsVerifyButtonTarget(target) || IsChallengeIframeTarget(target):
+			others = append(others, target)
 		}
 	}
-	return relevant
+	return append(checkboxes, others...)
 }
 
 func FallbackChallengeTargets(targets []ClickTarget) []ClickTarget {
@@ -283,6 +326,13 @@ func FallbackChallengeTargets(targets []ClickTarget) []ClickTarget {
 				candidates = append(candidates, target)
 			}
 		case "button", "input", "role_button":
+			// The checkbox is exempt from the size window: it is identified
+			// exactly by tag+type, and at ~24x24 it fails the 40px floor that
+			// the window uses to reject page furniture.
+			if IsTurnstileCheckboxTarget(target) {
+				candidates = append(candidates, target)
+				continue
+			}
 			if target.Width >= 40 && target.Width <= 500 && target.Height >= 20 && target.Height <= 180 {
 				candidates = append(candidates, target)
 			}
@@ -291,6 +341,25 @@ func FallbackChallengeTargets(targets []ClickTarget) []ClickTarget {
 	return candidates
 }
 
+// TabbableTargets returns the elements a Tab key could reach, for the
+// last-resort step that clicks whichever one the challenge probably means.
+//
+// Anchors are excluded, and that exclusion is load-bearing rather than tidy.
+// A bare Cloudflare interstitial contains exactly one link — the "Cloudflare"
+// branding link, which opens www.cloudflare.com in a new tab — and this
+// function used to admit it twice over: through a `case "a"` that asked only
+// whether Src was empty (Src is populated for iframes only, so every anchor
+// passed), and through the TabIndex check above it, because the DOM reports
+// tabIndex 0 for any focusable anchor. Removing the first alone would have
+// changed nothing.
+//
+// Measured on the production box 2026-11-14: every failed solve logged
+// `closed stray browser tabs the page opened closed=3` — three tabs on
+// www.cloudflare.com per 90-second attempt — while rutracker, kinozal and
+// bitru reported zero successful solves for most of the day.
+//
+// An anchor that genuinely acts as a control still qualifies through the role
+// check, so no real button is lost by this.
 func TabbableTargets(targets []ClickTarget) []ClickTarget {
 	candidates := make([]ClickTarget, 0, len(targets))
 	for _, target := range targets {
@@ -300,19 +369,20 @@ func TabbableTargets(targets []ClickTarget) []ClickTarget {
 		if target.Width <= 0 || target.Height <= 0 {
 			continue
 		}
+		if target.Role == "button" {
+			candidates = append(candidates, target)
+			continue
+		}
+		// Checked before everything below, including TabIndex.
+		if target.Tag == "a" || target.Kind == "anchor" {
+			continue
+		}
 		if target.TabIndex >= 0 {
 			candidates = append(candidates, target)
 			continue
 		}
 		switch target.Tag {
 		case "iframe", "button", "input", "textarea", "select":
-			candidates = append(candidates, target)
-		case "a":
-			if target.Src == "" {
-				candidates = append(candidates, target)
-			}
-		}
-		if target.Role == "button" {
 			candidates = append(candidates, target)
 		}
 	}
