@@ -9,4 +9,4 @@ package buildinfo
 // The literal below is the fallback for `go run` and plain `go build`, so it
 // only needs bumping when the last released version should be the default for
 // unstamped builds.
-var Version = "1.1.1"
+var Version = "1.1.2"
