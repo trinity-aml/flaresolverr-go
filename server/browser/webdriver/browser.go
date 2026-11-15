@@ -243,6 +243,18 @@ func (b *webDriverBrowser) Close() error {
 	b.sess.Delete(deleteCtx)
 	cancel()
 	b.driver.Stop()
+	// Deleting the WebDriver session is the only thing that makes chromedriver
+	// kill its Chrome, and the Delete above both has a 5 s budget and discards
+	// its error — so a browser that stopped responding survives the driver and
+	// is reparented to init, holding its renderers and its profile forever.
+	// Measured on production 2026-11-15: three such orphans in fourteen hours,
+	// 3918 MB of Chrome against 1395 MB once they were reaped, and only a
+	// service restart ever cleared them. See browser.KillProcessesUsingUserDataDir.
+	if !b.keepUserDataDir {
+		if n := browserpkg.KillProcessesUsingUserDataDir(b.userDataDir); n > 0 {
+			b.logger.Info("killed browser processes the driver left behind", "count", n, "dir", b.userDataDir)
+		}
+	}
 	if b.patchedDriverDir != "" {
 		_ = os.RemoveAll(b.patchedDriverDir)
 		b.patchedDriverDir = ""

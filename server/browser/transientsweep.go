@@ -33,6 +33,11 @@ import (
 
 const transientOwnerFile = ".flaresolverr-owner"
 
+// transientDirPrefix is what marks a directory as ours. Shared with the
+// orphan reaper in orphanbrowser.go so the two cannot disagree about which
+// directories this library is allowed to act on.
+const transientDirPrefix = "flaresolverr-go-"
+
 var transientSweepOnce sync.Once
 
 // writeTransientOwner records who owns a freshly created transient directory.
@@ -73,7 +78,7 @@ func SweepStaleTransientDirs() (removed int, freedBytes int64) {
 			continue
 		}
 		for _, e := range entries {
-			if !e.IsDir() || !strings.HasPrefix(e.Name(), "flaresolverr-go-") {
+			if !e.IsDir() || !strings.HasPrefix(e.Name(), transientDirPrefix) {
 				continue
 			}
 			dir := filepath.Join(root, e.Name())
