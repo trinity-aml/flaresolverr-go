@@ -33,19 +33,52 @@ var AccessDeniedSelectors = []string{
 	"#cf-error-details div.cf-error-overview h1",
 }
 
+// ChallengeTitles is a *fallback*, not the detector. Cloudflare serves the
+// interstitial in the browser's own language, so the title is whatever
+// Accept-Language asked for — "Один момент…" on a ru-RU browser, and some
+// other string in each of the dozens of locales CF ships. Matching titles is
+// therefore a list that can never be finished, and every miss costs a page:
+// detection returns false, the challenge is never solved, and the interstitial
+// is handed back to the caller as the answer with its own 403.
+//
+// Measured 2026-11-15 against bitru.org, same box and same minute, one browser
+// built twice:
+//
+//	--accept-lang=en-US  "Торренты | Фильмы | Стр. 430"  Challenge solved!        200  124 739 B
+//	--accept-lang=ru-RU  "Один момент…"                  Challenge not detected!  403   44 863 B
+//
+// So the language-independent markers in ChallengeSelectors below are what has
+// to carry the detection. Do not "fix" a locale by appending its title here.
 var ChallengeTitles = []string{
 	"Just a moment...",
 	"DDoS-Guard",
 }
 
+// ChallengeSelectors identifies a challenge page by its markup rather than its
+// prose. Every entry has to satisfy two conditions, both of which were checked
+// against a captured pair of pages — the interstitial and the real listing the
+// same URL serves once it clears:
+//
+//   - present on the challenge page, or it detects nothing;
+//   - **absent** once the challenge clears, because challengePresent is also
+//     the loop condition in solveChallenge. A marker that survives the solve
+//     turns that loop into one that never exits.
+//
+// `/cdn-cgi/challenge-platform/` fails the second condition and is deliberately
+// not here: the cleared page loads `challenge-platform/scripts/jsd/main.js` for
+// telemetry, so matching the path would report a challenge on a page that has
+// none. Only the challenge page carries `orchestrate/chl_page`.
 var ChallengeSelectors = []string{
 	"#cf-challenge-running",
 	".ray_id",
+	".ray-id",
 	".attack-box",
 	"#cf-please-wait",
 	"#challenge-spinner",
+	"#challenge-error-text",
 	"#trk_jschal_js",
 	"#turnstile-wrapper",
+	"input[name='cf-turnstile-response']",
 	".lds-ring",
 	"td.info #js_info",
 	"div.vc div.text-box h2",

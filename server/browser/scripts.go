@@ -181,3 +181,18 @@ const HasFocusScript = `document.hasFocus ? document.hasFocus() : true`
 // been triggered but not yet committed still reports the *previous* document's
 // "complete" — which is exactly the state right after a challenge clears.
 const DocumentReadyScript = `document.readyState === 'complete' && !!document.body`
+
+// ChallengeMarkerScript reports whether Cloudflare's challenge runtime is on
+// the page, by the one name that is neither translated nor obfuscated:
+// `window._cf_chl_opt`, the config object the challenge script declares for
+// itself. Every Cloudflare challenge page carries it — managed, interactive
+// and JS alike — and a page that has cleared the challenge carries none, so it
+// is safe as the loop condition in solveChallenge.
+//
+// This is checked before the title and the selectors because it is also the
+// cheapest: one evaluate against up to thirteen selector round-trips, on a
+// function the solve loop calls once per attempt. A page whose markup drifts
+// still has this.
+const ChallengeMarkerScript = `(() => {
+	try { return typeof window._cf_chl_opt !== 'undefined'; } catch (e) { return false; }
+})()`

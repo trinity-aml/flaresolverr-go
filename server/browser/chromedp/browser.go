@@ -1177,6 +1177,18 @@ func (b *chromedpBrowser) debugChallengeState(ctx context.Context, stage string)
 }
 
 func (b *chromedpBrowser) challengePresent(ctx context.Context) (bool, error) {
+	// The challenge runtime is the authority here; the title and the selectors
+	// below are fallbacks. See ChallengeTitles for why a title cannot carry
+	// this: Cloudflare serves the interstitial in the browser's own language.
+	var marked bool
+	if err := chromedp.Run(ctx, chromedp.Evaluate(browserpkg.ChallengeMarkerScript, &marked)); err == nil {
+		if marked {
+			return true, nil
+		}
+	} else {
+		b.logger.Debug("challenge marker probe failed", "err", err)
+	}
+
 	title, err := b.pageTitle(ctx)
 	if err != nil {
 		return false, err

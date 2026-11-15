@@ -1388,6 +1388,17 @@ func (b *webDriverBrowser) debugChallengeState(ctx context.Context, stage string
 }
 
 func (b *webDriverBrowser) challengePresent(ctx context.Context) (bool, error) {
+	// The challenge runtime is the authority here; the title and the selectors
+	// below are fallbacks. See ChallengeTitles for why a title cannot carry
+	// this: Cloudflare serves the interstitial in the browser's own language.
+	if marked, err := b.sess.ExecuteBool(ctx, browserpkg.ChallengeMarkerScript); err == nil {
+		if marked {
+			return true, nil
+		}
+	} else {
+		b.logger.Debug("challenge marker probe failed", "err", err)
+	}
+
 	title, err := b.sess.Title(ctx)
 	if err != nil {
 		return false, err
