@@ -1,10 +1,11 @@
+//go:build linux
+
 package browser
 
 import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -39,9 +40,6 @@ func alive(pid int) bool { return syscall.Kill(pid, 0) == nil }
 
 // The whole point: a browser the driver left behind must die.
 func TestAnOrphanedBrowserIsKilledByItsProfileDir(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("the scan reads /proc")
-	}
 	dir := filepath.Join(t.TempDir(), transientDirPrefix+"profile-test")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
@@ -66,9 +64,6 @@ func TestAnOrphanedBrowserIsKilledByItsProfileDir(t *testing.T) {
 // never be used to pick kill targets — the same rule cleanupUserDataDir
 // follows through keepUserDataDir.
 func TestADirectoryThatIsNotOursPicksNoTargets(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("the scan reads /proc")
-	}
 	dir := filepath.Join(t.TempDir(), "my-own-chrome-profile")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
@@ -90,9 +85,6 @@ func TestADirectoryThatIsNotOursPicksNoTargets(t *testing.T) {
 // another's would otherwise take its neighbour down with it, and these paths
 // differ only by a random suffix.
 func TestAPrefixOfAnotherProfileIsNotAMatch(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("the scan reads /proc")
-	}
 	base := t.TempDir()
 	short := filepath.Join(base, transientDirPrefix+"profile-1")
 	long := filepath.Join(base, transientDirPrefix+"profile-12345")
