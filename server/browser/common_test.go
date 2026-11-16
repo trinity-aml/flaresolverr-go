@@ -186,7 +186,14 @@ func TestIsChallengeIframeTarget(t *testing.T) {
 		target ClickTarget
 		want   bool
 	}{
-		{"turnstile src", ClickTarget{Kind: "iframe", Visible: true, Src: "https://challenges.cloudflare.com/turnstile/x"}, true},
+		// A named challenge iframe is a target only while it is big enough to
+		// hold one. This case used to assert the opposite — a turnstile src with
+		// no box at all counted as clickable — which is what let the collapsed
+		// invisible widget disarm the "no interactive controls" bail-out and
+		// burn the full 90-second budget on clicks aimed at the page corner.
+		{"turnstile src, widget sized", ClickTarget{Kind: "iframe", Visible: true, Src: "https://challenges.cloudflare.com/turnstile/x", Width: 300, Height: 65}, true},
+		{"turnstile src, collapsed to 1x1", ClickTarget{Kind: "iframe", Visible: true, Src: "https://challenges.cloudflare.com/turnstile/x", Width: 1, Height: 1}, false},
+		{"turnstile src, no box reported", ClickTarget{Kind: "iframe", Visible: true, Src: "https://challenges.cloudflare.com/turnstile/x"}, false},
 		{"widget-sized iframe", ClickTarget{Kind: "iframe", Visible: true, Width: 300, Height: 65}, true},
 		{"full-page iframe", ClickTarget{Kind: "iframe", Visible: true, Width: 1200, Height: 800}, false},
 		{"button is not an iframe", ClickTarget{Kind: "button", Visible: true, Src: "cloudflare"}, false},
@@ -337,5 +344,41 @@ func TestValidateProxy(t *testing.T) {
 	}
 	if err := ValidateProxy(&Proxy{URL: "not a url at all"}); err == nil {
 		t.Error("a malformed proxy url must be rejected, not silently ignored")
+	}
+}
+
+// TestACollapsedWidgetLeavesNoTargetsToClick is the behavioural half, and the
+// reason the size floor exists at all.
+//
+// Measured 2026-11-16 against bitru.org: Cloudflare serves the invisible
+// managed challenge as an iframe at rect=(0.1,0.0 1.0x1.0) with tabIndex=-1.
+// There is nothing in it to click. While that counted as a target,
+// solveChallenge saw a non-empty target list on every attempt, reset
+// passiveStreak and never reached its `passiveBailout` — so instead of giving
+// up in ~10 s it clicked the page corner for the whole 90-second budget. One
+// production night spent 253 solves that way.
+func TestACollapsedWidgetLeavesNoTargetsToClick(t *testing.T) {
+	collapsed := ClickTarget{
+		Kind:     "iframe",
+		Visible:  true,
+		Src:      "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/turnstile/f/av0/rch/82ey3/0x4AAAAAAADnOjc0PNeA8qVm/light/fbE/new/normal?lang=auto",
+		Left:     0.1,
+		Width:    1,
+		Height:   1,
+		TabIndex: -1,
+	}
+	if got := RelevantChallengeTargets([]ClickTarget{collapsed}); len(got) != 0 {
+		t.Errorf("a 1x1 challenge iframe is still offered as a click target: %+v", got)
+	}
+	if got := FallbackChallengeTargets([]ClickTarget{collapsed}); len(got) != 0 {
+		t.Errorf("a 1x1 challenge iframe is still offered as a fallback target: %+v", got)
+	}
+
+	// The interactive widget, as the same site served it two days earlier, must
+	// still be found — the floor separates the two, it does not disable clicking.
+	interactive := collapsed
+	interactive.Left, interactive.Top, interactive.Width, interactive.Height, interactive.TabIndex = 489.5, 304, 300, 65, 0
+	if got := RelevantChallengeTargets([]ClickTarget{interactive}); len(got) == 0 {
+		t.Error("the interactive 300x65 Turnstile widget is no longer a click target")
 	}
 }

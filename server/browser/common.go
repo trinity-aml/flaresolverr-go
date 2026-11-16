@@ -277,8 +277,32 @@ func IsVerifyButtonTarget(target ClickTarget) bool {
 	return strings.Contains(haystack, "verify") && strings.Contains(haystack, "human")
 }
 
+// minClickableChallengeBox is the smallest box a challenge iframe can be and
+// still hold something to click. Measured 2026-11-16 against bitru.org:
+// Cloudflare serves the *invisible* managed challenge here as
+//
+//	rect=(0.1,0.0 1.0x1.0)  tabIndex=-1
+//
+// — one pixel in the page corner, not focusable, nothing to click by
+// construction. Two days earlier the same site served the interactive widget at
+// rect=(489.5,304.0 300.0x65.0) with tabIndex=0, so the two differ by orders of
+// magnitude and this floor separates them with room to spare.
+const minClickableChallengeBox = 16
+
 func IsChallengeIframeTarget(target ClickTarget) bool {
 	if target.Kind != "iframe" || !target.Visible {
+		return false
+	}
+
+	// The size check has to come *before* the name match, not after it. The
+	// name match below accepts any iframe whose src says "challenge", so a
+	// collapsed widget was reported as a click target and cost twice over:
+	// every step in the click path aimed at the page corner, and — worse —
+	// `relevant` came back non-empty, which resets passiveStreak in
+	// solveChallenge and disarms the "no interactive controls" bail-out. A
+	// doomed solve therefore burned the whole 90-second budget instead of
+	// giving up in ~10 s. Production spent 253 solves that way in one night.
+	if target.Width < minClickableChallengeBox || target.Height < minClickableChallengeBox {
 		return false
 	}
 
