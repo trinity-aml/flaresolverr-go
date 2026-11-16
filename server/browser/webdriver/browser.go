@@ -551,7 +551,27 @@ func (b *webDriverBrowser) installStealth(ctx context.Context) error {
 			safeDefine(navigator.connection, 'downlink', () => 10);
 			safeDefine(navigator.connection, 'effectiveType', () => '4g');
 		}
-		safeDefine(navigator, 'languages', () => navigator.languages && navigator.languages.length ? navigator.languages : ['en-US', 'en']);
+		// The getter used to read navigator.languages — the very property it
+		// defines — so every read recursed until the stack blew and the page got
+		// a RangeError where a real browser returns an array. Measured on this
+		// build: navigator.languages answered "Maximum call stack size
+		// exceeded". An anti-bot reads that property early and no real browser
+		// throws there.
+		//
+		// Read eagerly, while the property is still the native one, and then
+		// **only define it when the browser has nothing to report**. Replacing a
+		// real value with a guess is the worse bug of the two: this browser is
+		// launched with --accept-lang and sends Accept-Language to match, so a
+		// hardcoded ['en-US','en'] would contradict its own request headers —
+		// the mismatch Cloudflare compares.
+		let nativeLanguages = null;
+		try {
+			const list = navigator.languages;
+			if (list && list.length) nativeLanguages = Array.prototype.slice.call(list);
+		} catch (_) {}
+		if (!nativeLanguages) {
+			safeDefine(navigator, 'languages', () => ['en-US', 'en']);
+		}
 
 		// PluginArray / MimeTypeArray — mimic real Chrome PDF plugins so that
 		// CF fingerprinting sees proper Plugin objects (not a number array).
@@ -609,10 +629,16 @@ func (b *webDriverBrowser) installStealth(ctx context.Context) error {
 
 		// userAgentData — return a plausible sec-ch-ua profile (Chrome)
 		try {
+			// The major is read back out of the User-Agent instead of being
+			// written here. A literal drifts the moment the browser is bumped, and
+			// then sec-ch-ua disagrees with the UA on the same request — which is
+			// the mismatch Cloudflare compares. Measured on this build before the
+			// fix: UA said Chrome/146.0.0.0 while these brands said 147.
+			const uaMajor = (String(navigator.userAgent).match(/Chrome\/(\d+)/) || [])[1] || '146';
 			const brands = [
 				{ brand: 'Not)A;Brand', version: '99' },
-				{ brand: 'Google Chrome', version: '147' },
-				{ brand: 'Chromium', version: '147' },
+				{ brand: 'Google Chrome', version: uaMajor },
+				{ brand: 'Chromium', version: uaMajor },
 			];
 			const uaData = {
 				brands: brands,
