@@ -66,19 +66,17 @@ func (s *session) close() error {
 }
 
 type sessionStore struct {
-	cfg         Config
-	factory     browserFactory
-	userAgentFn func() string
-	mu          sync.RWMutex
-	sessions    map[string]*session
+	cfg      Config
+	factory  browserFactory
+	mu       sync.RWMutex
+	sessions map[string]*session
 }
 
-func newSessionStore(cfg Config, factory browserFactory, userAgentFn func() string) *sessionStore {
+func newSessionStore(cfg Config, factory browserFactory) *sessionStore {
 	return &sessionStore{
-		cfg:         cfg,
-		factory:     factory,
-		userAgentFn: userAgentFn,
-		sessions:    make(map[string]*session),
+		cfg:      cfg,
+		factory:  factory,
+		sessions: make(map[string]*session),
 	}
 }
 
@@ -124,12 +122,34 @@ func (s *sessionStore) create(ctx context.Context, sessionID string, proxy *Prox
 	s.sessions[sessionID] = item
 
 	cfg := s.cfg.withDefaults()
-	userAgentFn := s.userAgentFn
 	s.mu.Unlock()
 
-	if cfg.StartupUserAgent == "" && userAgentFn != nil {
-		cfg.StartupUserAgent = userAgentFn()
-	}
+	// The cached user agent is deliberately NOT fed back in here, and it must
+	// not be reintroduced.
+	//
+	// This block used to read the UA the first browser reported and hand it to
+	// every later one, which put `--user-agent=<that string>` on their command
+	// line. The value was identical to what the browser reports natively, so it
+	// changed nothing about the UA — and broke the cold solve outright.
+	//
+	// Measured on CloakBrowser 146 against bitru.org, first request of a fresh
+	// process, the flag the only difference:
+	//
+	//	no --user-agent    13 s  Challenge solved!
+	//	   --user-agent    20 s  challenge still present
+	//
+	// That is the command-line twin of the trap the CDP path already guards
+	// (`overrideUA == currentUA` in the webdriver backend, with its own note
+	// about a no-op override being "the entire difference between clearing the
+	// managed challenge in ~7s and looping on it forever"). Passing the flag
+	// marks the UA as overridden whatever the value is, and the challenge reads
+	// that.
+	//
+	// It is also the whole of "it only works right after a restart": the first
+	// browser of a process had nothing cached and so launched clean, every one
+	// after it carried the flag, and only a new Service — or a restart — cleared
+	// the cache. An explicit StartupUserAgent from config or STARTUP_USER_AGENT
+	// still applies: that is someone asking for a specific UA on purpose.
 
 	browser, err := s.factory.New(ctx, cfg, proxy)
 	item.browser = browser

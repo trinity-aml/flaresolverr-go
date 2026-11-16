@@ -82,7 +82,7 @@ func (f *fakeFactory) all() []*fakeBrowser {
 }
 
 func newTestStore(factory browserFactory) *sessionStore {
-	return newSessionStore(PrepareConfig(Config{}), factory, nil)
+	return newSessionStore(PrepareConfig(Config{}), factory)
 }
 
 func TestSessionStoreCreateAndReuse(t *testing.T) {

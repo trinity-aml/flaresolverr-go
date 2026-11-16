@@ -40,7 +40,7 @@ func newService(cfg Config, factory browserFactory) *Service {
 		logger:  cfg.Logger,
 		factory: factory,
 	}
-	service.sessions = newSessionStore(cfg, factory, service.peekUserAgent)
+	service.sessions = newSessionStore(cfg, factory)
 	return service
 }
 
